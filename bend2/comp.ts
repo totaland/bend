@@ -251,6 +251,7 @@ const OPERATIONS: Record<string, Intr> = Object.setPrototypeOf({
   array_q4mv: { C: ["$0", "$1", "q4mv(e, $0, $1, $2, $3, $4, $5, $6, 0)"] },
   array_q4go: { C: ["$0", "$1", "q4mv(e, $0, $1, $2, $3, $4, $5, $6, 1)"] },
   array_q4wait: { C: "q4wait($0)" },
+  array_amq: { C: ["$0", "amq(e, $0, $1, $2)"] },
   array_rmsq: { C: ["$0", "$1", "$2", "rmsq(e, $0, $1, $2, $3, $4, $5, $6)"] },
   array_swq: { C: ["$0", "swq(e, $0, $1, $2)"] },
   array_atq: { C: ["$0", "$1", "$2", "$3", "$4",
@@ -1420,7 +1421,7 @@ function file_book(roots: Name[]): void {
       }
       if (s.$ === "Ref") {
         if (s.b || ["Array.q4go", "Array.rmsq", "Array.swq", "Array.gdn",
-          "Array.atq"].includes(s.k)) {
+          "Array.atq", "Array.amq"].includes(s.k)) {
           FL.bangs.add(s.k);
         }
         if (intr_of(s.k, FL.js) === undefined) {
@@ -3595,6 +3596,9 @@ static id<MTLComputePipelineState>  gpu_rmpso;
 static id<MTLComputePipelineState>  gpu_swpso;
 static id<MTLComputePipelineState>  gpu_gdpso;
 static id<MTLComputePipelineState>  gpu_atpso;
+static id<MTLComputePipelineState>  gpu_ampso;
+static id<MTLComputePipelineState>  gpu_amfpso;
+static id<MTLBuffer> gpu_amscratch;
 #elif BEND_CUDA
 static CUdevice   gpu_dev;
 static CUmodule   gpu_lib;
@@ -4401,6 +4405,36 @@ INLINE Term q4mv(Env e, Term w, Term x, Term y, u64 r, u64 n, u64 cols,
   return y;
 }
 
+#if !DEVICE && BEND_METAL
+static bool gpu_amq(u64 xl, u64 ol, u32 n);
+#endif
+INLINE Term amq(Env e, Term x, Term o, u64 n) {
+  DEV u64* H = e.mem;
+  DEV u32a* X = blk_ptr(H, blk_loc(H, x), 0);
+  DEV u32a* O = blk_ptr(H, blk_loc(H, o), 0);
+  u64 xm = (1ull << blk_cls(x)) - 1;
+#if !DEVICE && BEND_METAL
+  if (n <= xm + 1 && blk_cls(o) >= 1 && n <= 0xffffffffull &&
+      gpu_amq(blk_loc(H, x), blk_loc(H, o), (u32)n)) {
+    return o;
+  }
+  gpu_q4wait();
+#endif
+  u32 bi = 0, bv = n ? X[0] : 0;
+  for (u64 i = 1; i < n; i += 1) {
+    u32 v = X[i & xm];
+    if (f32_unbox(v) > f32_unbox(bv)) {
+      bi = (u32)i;
+    }
+    if (!(f32_unbox(v) < f32_unbox(bv))) {
+      bv = v;
+    }
+  }
+  O[0] = bi;
+  O[1 & ((1ull << blk_cls(o)) - 1)] = bv;
+  return o;
+}
+
 // Array.rmsq: base.bend's residual add and RMS norm into q4 activations; a
 // Metal heap queues it between the products before and after it.
 #if !DEVICE && BEND_METAL
@@ -5147,6 +5181,81 @@ kernel void bend_q4mv(device const u32* W [[buffer(0)]],
     if (l == 0 && r < nr) {
       Y[i0 + r] = q4_round(v);
     }
+  }
+}
+
+INLINE u32 amq_order_key(u32 v) {
+  v = (v & 0x7fffffffu) == 0 ? 0 : v;
+  return v & 0x80000000u ? ~v : v ^ 0x80000000u;
+}
+
+struct AMQ {
+  u32 first, last, bits, nan;
+};
+
+INLINE AMQ amq_pick(AMQ a, AMQ b) {
+  u32 bad = a.nan | b.nan;
+  u32 x = amq_order_key(a.bits), y = amq_order_key(b.bits);
+  if (b.first != 0xffffffffu && (a.first == 0xffffffffu || y > x)) {
+    a = b;
+  } else if (y == x && b.first != 0xffffffffu) {
+    a.first = min(a.first, b.first);
+    if (b.last > a.last) { a.last = b.last; a.bits = b.bits; }
+  }
+  a.nan = bad;
+  return a;
+}
+
+INLINE AMQ amq_simd(AMQ a) {
+  for (ushort s = 16; s > 0; s >>= 1) {
+    a = amq_pick(a, AMQ{simd_shuffle_down(a.first, s),
+      simd_shuffle_down(a.last, s), simd_shuffle_down(a.bits, s),
+      simd_shuffle_down(a.nan, s)});
+  }
+  return a;
+}
+
+kernel void bend_amq(device const u32* X [[buffer(0)]], device AMQ* A [[buffer(1)]],
+  constant u32* P [[buffer(2)]], u32 tg [[threadgroup_position_in_grid]],
+  u32 t [[thread_position_in_threadgroup]], u32 sg [[simdgroup_index_in_threadgroup]],
+  u32 l [[thread_index_in_simdgroup]]) {
+  threadgroup AMQ ps[8];
+  AMQ a{0xffffffffu, 0, 0xff800000u, 0};
+  for (u64 i = ((u64)tg * 256 + t) * 4; i < P[0]; i += (u64)P[1] * 1024) {
+    for (u32 j = 0; j < 4 && i + j < P[0]; j += 1) {
+      u32 v = X[i + j];
+      a = amq_pick(a, AMQ{(u32)i + j, (u32)i + j, v,
+        (v & 0x7fffffffu) > 0x7f800000u});
+    }
+  }
+  a = amq_simd(a);
+  if (l == 0) { ps[sg] = a; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0) {
+    a = l < 8 ? ps[l] : AMQ{0xffffffffu, 0, 0xff800000u, 0};
+    a = amq_simd(a);
+    if (l == 0) { A[tg] = a; }
+  }
+}
+
+kernel void bend_amq_fin(device const u32* X [[buffer(0)]], device u32* O [[buffer(1)]],
+  device const AMQ* A [[buffer(2)]], constant u32* P [[buffer(3)]],
+  u32 l [[thread_index_in_simdgroup]]) {
+  AMQ a = l < P[1] ? A[l] : AMQ{0xffffffffu, 0, 0xff800000u, 0};
+  a = amq_simd(a);
+  if (l == 0) {
+    u32 bi = P[0] ? a.first : 0, bv = P[0] ? a.bits : 0;
+    if (a.nan) {
+      bi = 0; bv = X[0];
+      for (u32 i = 1; i < P[0]; i += 1) {
+        u32 v = X[i];
+        bool unordered = (v & 0x7fffffffu) > 0x7f800000u
+          || (bv & 0x7fffffffu) > 0x7f800000u;
+        if (!unordered && amq_order_key(v) > amq_order_key(bv)) { bi = i; }
+        if (unordered || amq_order_key(v) >= amq_order_key(bv)) { bv = v; }
+      }
+    }
+    O[0] = bi; O[1] = bv;
   }
 }
 
@@ -5947,6 +6056,10 @@ static void gpu_qinit(void) {
     gpu_swpso = gpu_fn(@"bend_swq");
     gpu_gdpso = gpu_fn(@"bend_gdn");
     gpu_atpso = gpu_fn(@"bend_atq");
+    gpu_ampso = gpu_fn(@"bend_amq");
+    gpu_amfpso = gpu_fn(@"bend_amq_fin");
+    gpu_amscratch = [gpu_dev newBufferWithLength:32 * 16
+      options:MTLResourceStorageModePrivate];
     gpu_qflag = [gpu_dev newBufferWithLength:64
       options:MTLResourceStorageModeShared];
   }
@@ -5996,6 +6109,36 @@ static void gpu_qkern(id<MTLComputePipelineState> pso, const u64* at, u32 nb,
   [gpu_qenc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
     threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
   [gpu_qenc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+}
+
+static bool gpu_amq(u64 xl, u64 ol, u32 n) {
+  if (gpu_buf == nil || gpu_lib == nil) {
+    return false;
+  }
+  @autoreleasepool {
+    pthread_mutex_lock(&gpu_qlock);
+    u32 p[2] = { n, (u32)(((u64)n + 1023) / 1024) };
+    p[1] = p[1] < 1 ? 1 : p[1] > 32 ? 32 : p[1];
+    gpu_qopen();
+    [gpu_qenc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [gpu_qenc setComputePipelineState:gpu_ampso];
+    [gpu_qenc setBuffer:gpu_buf offset:xl * 8 atIndex:0];
+    [gpu_qenc setBuffer:gpu_amscratch offset:0 atIndex:1];
+    [gpu_qenc setBytes:p length:sizeof p atIndex:2];
+    [gpu_qenc dispatchThreadgroups:MTLSizeMake(p[1], 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [gpu_qenc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [gpu_qenc setComputePipelineState:gpu_amfpso];
+    [gpu_qenc setBuffer:gpu_buf offset:xl * 8 atIndex:0];
+    [gpu_qenc setBuffer:gpu_buf offset:ol * 8 atIndex:1];
+    [gpu_qenc setBuffer:gpu_amscratch offset:0 atIndex:2];
+    [gpu_qenc setBytes:p length:sizeof p atIndex:3];
+    [gpu_qenc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [gpu_qenc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    pthread_mutex_unlock(&gpu_qlock);
+  }
+  return true;
 }
 
 static bool gpu_swq(u64 al, u64 ol, u32 n) {
@@ -6050,7 +6193,9 @@ static bool gpu_q4mv(u64 wl, u64 xl, u64 yl, u32 wm, u32 xm, u32 ym, u32 r,
       pthread_mutex_lock(&gpu_qlock);
       gpu_qopen();
     } else {
+      pthread_mutex_lock(&gpu_qlock);
       gpu_qinit();
+      pthread_mutex_unlock(&gpu_qlock);
     }
     id<MTLCommandBuffer> cb = q ? gpu_qcb : [gpu_que commandBuffer];
     id<MTLComputeCommandEncoder> enc = q ? gpu_qenc : [cb computeCommandEncoder];

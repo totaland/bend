@@ -2645,6 +2645,51 @@ def Array.q4go(w: Array<U32>, x: Array<F32>, y: Array<F32>, +r: U32, +n: U32, +c
 def Array.q4wait(x: Array<F32>) -> Array<F32>:
   x
 
+# Array.amq scans the first n slots, writing its index to o[0] and its
+# final F32 bits to o[1]. The index changes only on x > best; best changes
+# on !(x < best), including ties and NaNs. n=0 gives (0, 0.0). A native Metal
+# heap queues this after earlier products; keep x and o until q4wait(x).
+def Array.amq.id(c: Bool, +x: U32, +y: U32) -> U32:
+  match c:
+    case True{}:
+      x
+    case False{}:
+      y
+
+def Array.amq.val(c: Bool, +x: F32, +y: F32) -> F32:
+  match c:
+    case True{}:
+      x
+    case False{}:
+      y
+
+def Array.amq.put(x: Array<F32>, o: Array<U32>, +bi: U32, +bv: F32) -> Array<F32> & Array<U32>:
+  (x, Array.set(U32, Array.set(U32, o, 0, bi), 1, Array.q4mv.bits(bv)))
+
+def Array.amq.go(n: Nat, r: Array<F32> & F32, o: Array<U32>, +i: U32, +bi: U32, +bv: F32) -> Array<F32> & Array<U32>:
+  match n:
+    case 0n:
+      (x, v) = r
+      Array.amq.put(x, o, bi, bv)
+    case 1n+p:
+      (x, +v) = r
+      Array.amq.go(p, Array.get(F32, x, (i + 1 : U32)), o, (i + 1 : U32), Array.amq.id(F32.is_gt(v, bv), i, bi),
+        Array.amq.val(F32.is_lt(v, bv), bv, v))
+
+def Array.amq.first(r: Array<F32> & F32, o: Array<U32>, +n: Nat) -> Array<F32> & Array<U32>:
+  (x, +v) = r
+  Array.amq.go(n, Array.get(F32, x, 1), o, 1, 0, v)
+
+def Array.amq.start(n: Nat, x: Array<F32>, o: Array<U32>) -> Array<F32> & Array<U32>:
+  match n:
+    case 0n:
+      Array.amq.put(x, o, 0, 0.0)
+    case 1n+p:
+      Array.amq.first(Array.get(F32, x, 0), o, p)
+
+def Array.amq(x: Array<F32>, o: Array<U32>, +n: U32) -> Array<F32> & Array<U32>:
+  Array.amq.start(U32.to_nat(n), x, o)
+
 # Array.rmsq(x, y, w, o, n, eps, add) is the residual add and RMS norm that
 # feeds Array.q4mv, for n a multiple of 64. When add is not 0, x[i] becomes
 # x[i] + y[i] rounded to bfloat16 (as Array.q4mv rounds). s sums x[i] * x[i]
