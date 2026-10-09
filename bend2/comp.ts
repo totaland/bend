@@ -2789,8 +2789,11 @@ function effect_srcs(ext: string, miss: string): string[] {
 // C
 // -
 
-// A segment may fork if one it reaches does; Clo~apply reaches every
-// closure. The device holds what the bangs reach, and every closure when a
+// A segment may fork if one it reaches does; on the device Clo~apply
+// reaches every closure. On the host it reaches none: an applied closure
+// that forks, entered with nothing stacked over its task's frame, leaves
+// the fork-free mode its caller ran in. Else it runs in sequence, as every
+// closure caller did when one closure in the program forked. The device holds what the bangs reach, and every closure when a
 // bang's parameter may hold one. One bank serves both lanes: rp pads the
 // host's twelfth slot, which keeps rax free for the tail call. WL_LOAD is a
 // ladder, as clang builds the phi cascade of a fallthrough switch in O(n^2).
@@ -2894,9 +2897,11 @@ export function compile_book(book: Bend.Book): string {
   for (const [k] of done_defs(def_foreign)) {
     cids.set(k, fun_of(k).lays.length);
   }
-  const forky = graph_close(new Set(FL.segs.filter((s) => s.fork)
-    .map((s) => s.fid)), [...FL.segs, { fid: seg_fid(CLO_APPLY),
-    refs: FL.clos }].flatMap((s) => [...s.refs].map((r) => [r, s.fid])));
+  const forks = () => new Set(FL.segs.filter((s) => s.fork).map((s) => s.fid));
+  const calls = FL.segs.flatMap((s) => [...s.refs].map((r) => [r, s.fid]));
+  const forky = graph_close(forks(), [...calls,
+    ...[...FL.clos].map((c) => [c, seg_fid(CLO_APPLY)])]);
+  const hosty = graph_close(forks(), calls);
   const ars = [...cids.values()].map((n) => n > WIDE ? 240 + Math.log2(n) : n);
   if (entries.some((s) => s.params.length > WIDE) || ars.some((n) => n > 255)) {
     die("an arity over " + WIDE);
@@ -2913,7 +2918,8 @@ export function compile_book(book: Bend.Book): string {
   defs.push(`CONSTV u8 FID_T[][3] = { ${entries.map((s) =>
     `{ ${s.params.length}, ${s.frame === null ? 0
       : s.params.length - s.frame.at.length}, ${Number(FL.bangs.has(s.def))
-      | Number(!forky.has(s.fid)) << 1} }`).join(", ")} };`,
+      | Number(!forky.has(s.fid)) << 1 | Number(!hosty.has(s.fid)) << 2} }`)
+    .join(", ")} };`,
   `CONSTV u8 CID_T[][2] = { ${[...cids.keys()].map((k, i) =>
     `{ ${ars[i]}, ${Number(FL.hot.has(k))} }`).join(", ")} };`,
   `#define STAT_LEN ${FL.img.length}`, "",
@@ -3679,7 +3685,7 @@ ${tabs}
 #define fid_arity(x) ((u32)FID_T[x][0])
 #define fid_resw(x)  ((u32)FID_T[x][1])
 #define fid_bangs(x) ((bool)(FID_T[x][2] & 1))
-#define fid_nofk(x)  ((bool)(FID_T[x][2] & 2))
+#define fid_nofk(x)  ((bool)(FID_T[x][2] & (DEVICE ? 2 : 4)))
 #define cid_arity(x) ((u32)CID_T[x][0])
 #define cid_hot(x)   ((bool)CID_T[x][1])
 
@@ -5169,6 +5175,9 @@ ${segs}
     u32 f    = (u32)term_aux(fun);
     u32 war  = fid_arity(f) - 1;
     u64 a    = term_loc(fun);
+    if (!DEVICE && (seq & 2) && !fid_nofk(f) && STK(-1) == FID_EXIT) {
+      seq &= 1;
+    }
     WL_FAN_APPLY(a, war, arg, spare_free(e, cls_fit(war), a), f)
   }}
 
