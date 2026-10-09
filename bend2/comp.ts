@@ -4337,6 +4337,8 @@ static void gpu_qzero(u64 loc, u64 words);
 #endif
 // Backend selection for an inference package: do not launch a general bang
 // merely to discover CUDA, especially with host-only large-block links.
+// Host natives over CUDA kernels; Metal has no double math and names a type half.
+#ifndef __METAL_VERSION__
 INLINE Term q4cuda(void) {
 #if !DEVICE && BEND_CUDA
   return io_gpu ? 1 : 0;
@@ -4359,6 +4361,7 @@ INLINE Term q4new(Env e, u64 d) {
   Term zero[1] = {0};
   return blk_new(e, false, d, 0, 1, zero);
 }
+#endif
 
 // Array.q4mv: rows r .. r+n of an MLX affine q4g64 matrix against x, each
 // row summed in base.bend's tree order and narrowed to bfloat16 into y.
@@ -4487,6 +4490,7 @@ static bool gpu_qemb(u64 w, u64 o, u32 wm, u32 om, u32 r, u32 c, u32 rows);
 #if !DEVICE && BEND_CUDA
 static bool gpu_roq(u64 o, u32 om, u32 half, u32 pos, u32 base);
 #endif
+#ifndef __METAL_VERSION__
 INLINE Term roq(Env e, Term o, u64 half, u64 pos, u64 base) {
   u64 no=1ull<<blk_cls(o);
   bool fit=half<=256 && half*2<=no && pos<=0xffffffffu;
@@ -4527,6 +4531,7 @@ INLINE Term q4emb(Env e, Term w, Term o, u64 row, u64 cols, u64 rows) {
   }
   return o;
 }
+#endif
 
 INLINE Term q4mv(Env e, Term w, Term x, Term y, u64 r, u64 n, u64 cols,
   u64 rows, bool q) {
