@@ -3337,7 +3337,7 @@ using namespace metal;
 #define THR     thread
 #define TG      threadgroup
 #define INLINE  inline
-#define OUTLINE static
+#define OUTLINE static __attribute__((noinline))
 #define CONSTV  constant
 #define DEVICE  1
 #define CLZ(x)  clz(x)
