@@ -3573,6 +3573,8 @@ static id<MTLBuffer>               gpu_buf;
 static id<MTLComputeCommandEncoder> gpu_enc;
 static id<MTLLibrary>               gpu_lib;
 static id<MTLComputePipelineState> gpu_q4pso;
+static id<MTLCommandBuffer>         gpu_dcb;
+static id<MTLComputeCommandEncoder> gpu_denc;
 #elif BEND_CUDA
 static CUdevice   gpu_dev;
 static CUmodule   gpu_lib;
@@ -4289,6 +4291,18 @@ INLINE u32 q4_row(DEV u32a* W, DEV u32a* X, u32 wm, u32 xm, u32 i, u32 c,
 #if !DEVICE && BEND_METAL
 static bool gpu_q4mv(u64 wl, u64 xl, u64 yl, u32 wm, u32 xm, u32 ym, u32 r,
   u32 n, u32 c, u32 rows);
+static void gpu_q4flush(void);
+static void gpu_q4bar(void);
+// BEND_Q4_MIN=<weights> overrides the GPU break-even at run time.
+static u64 q4_min(void) {
+  static u64 m = 0;
+  if (m == 0) {
+    const char* s = getenv("BEND_Q4_MIN");
+    m = s ? strtoull(s, 0, 10) : Q4_GPU_MIN;
+    m = m ? m : 1;
+  }
+  return m;
+}
 #endif
 
 #if !DEVICE && defined(__ARM_NEON)
@@ -4349,7 +4363,16 @@ INLINE Term q4mv(Env e, Term w, Term x, Term y, u64 r, u64 n, u64 cols,
   bool fit = (u64)rows * (cw + 2 * sw) <= (u64)wm + 1
     && (u64)c + (c >> 6) <= (u64)xm + 1 && r + n <= (u64)ym + 1 && r + n <= rows;
 #if !DEVICE && BEND_METAL
-  if (fit && n * cols >= Q4_GPU_MIN && gpu_q4mv(blk_loc(H, w), blk_loc(H, x),
+  // n = 0 is a queue control: r = 1 adds a barrier, else commit and wait.
+  if (n == 0) {
+    if (r == 1) {
+      gpu_q4bar();
+    } else {
+      gpu_q4flush();
+    }
+    return y;
+  }
+  if (fit && n * cols >= q4_min() && gpu_q4mv(blk_loc(H, w), blk_loc(H, x),
       blk_loc(H, y), wm, xm, ym, i, (u32)n, c, (u32)rows)) {
     return y;
   }
@@ -5207,6 +5230,65 @@ static void gpu_pass(u32 f) {
   }
 }
 
+static int q4_env(const char* k) {
+  const char* s = getenv(k);
+  return s != NULL && s[0] == '1';
+}
+
+static double q4_us(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return t.tv_sec * 1e6 + t.tv_nsec / 1e3;
+}
+
+static double q4_t0;
+static u32    q4_k;
+
+static void gpu_q4enc(id<MTLComputeCommandEncoder> enc, u64 wl, u64 xl,
+  u64 yl, u32 wm, u32 xm, u32 ym, u32 r, u32 n, u32 c, u32 rows) {
+  u32 p[8] = { wm, xm, ym, c, rows, 0, r, n };
+  [enc setComputePipelineState:gpu_q4pso];
+  [enc setBuffer:gpu_buf offset:wl * 8 atIndex:0];
+  [enc setBuffer:gpu_buf offset:xl * 8 atIndex:1];
+  [enc setBuffer:gpu_buf offset:yl * 8 atIndex:2];
+  [enc setBytes:p length:sizeof p atIndex:3];
+  [enc dispatchThreadgroups:MTLSizeMake((n + 7) / 8, 1, 1)
+    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  if (!q4_env("BEND_Q4_CONC")) {
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+  }
+}
+
+static void gpu_q4bar(void) {
+  if (gpu_denc != nil) {
+    [gpu_denc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+  }
+}
+
+static void gpu_q4flush(void) {
+  if (gpu_denc == nil || q4_env("BEND_Q4_NOFLUSH")) {
+    return;
+  }
+  double t1 = q4_us();
+  [gpu_denc endEncoding];
+  [gpu_dcb commit];
+  [gpu_dcb waitUntilCompleted];
+  if ([gpu_dcb error]) {
+    gpu_fail([gpu_dcb error]);
+  }
+  if (q4_env("BEND_Q4_TRACE")) {
+    fprintf(stderr, "q4 batch k=%u enc_us=%.1f wall_us=%.1f gpu_us=%.1f\n",
+      q4_k, t1 - q4_t0, q4_us() - q4_t0,
+      ([gpu_dcb GPUEndTime] - [gpu_dcb GPUStartTime]) * 1e6);
+  }
+  gpu_denc = nil;
+  gpu_dcb  = nil;
+  q4_k     = 0;
+}
+
+// BEND_Q4_DEFER=1 encodes every product into one open command buffer that
+// the next n = 0 product commits; BEND_Q4_CONC=1 drops per-dispatch
+// barriers so only explicit stage barriers order the work.
 static bool gpu_q4mv(u64 wl, u64 xl, u64 yl, u32 wm, u32 xm, u32 ym, u32 r,
   u32 n, u32 c, u32 rows) {
   if (gpu_buf == nil || gpu_lib == nil) {
@@ -5221,21 +5303,32 @@ static bool gpu_q4mv(u64 wl, u64 xl, u64 yl, u32 wm, u32 xm, u32 ym, u32 r,
         gpu_fail(err);
       }
     }
-    u32 p[8] = { wm, xm, ym, c, rows, 0, r, n };
+    if (q4_env("BEND_Q4_DEFER")) {
+      if (gpu_denc == nil) {
+        q4_t0    = q4_us();
+        gpu_dcb  = [gpu_que commandBuffer];
+        gpu_denc = q4_env("BEND_Q4_CONC")
+          ? [gpu_dcb computeCommandEncoderWithDispatchType:
+            MTLDispatchTypeConcurrent]
+          : [gpu_dcb computeCommandEncoder];
+      }
+      gpu_q4enc(gpu_denc, wl, xl, yl, wm, xm, ym, r, n, c, rows);
+      q4_k += 1;
+      return true;
+    }
+    double t0 = q4_us();
     id<MTLCommandBuffer> cb = [gpu_que commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-    [enc setComputePipelineState:gpu_q4pso];
-    [enc setBuffer:gpu_buf offset:wl * 8 atIndex:0];
-    [enc setBuffer:gpu_buf offset:xl * 8 atIndex:1];
-    [enc setBuffer:gpu_buf offset:yl * 8 atIndex:2];
-    [enc setBytes:p length:sizeof p atIndex:3];
-    [enc dispatchThreadgroups:MTLSizeMake((n + 7) / 8, 1, 1)
-      threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    gpu_q4enc(enc, wl, xl, yl, wm, xm, ym, r, n, c, rows);
     [enc endEncoding];
     [cb commit];
     [cb waitUntilCompleted];
     if ([cb error]) {
       gpu_fail([cb error]);
+    }
+    if (q4_env("BEND_Q4_TRACE")) {
+      fprintf(stderr, "q4 sep n=%u c=%u wall_us=%.1f gpu_us=%.1f\n", n, c,
+        q4_us() - t0, ([cb GPUEndTime] - [cb GPUStartTime]) * 1e6);
     }
   }
   return true;
