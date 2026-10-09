@@ -2795,6 +2795,39 @@ function effect_srcs(ext: string, miss: string): string[] {
 // host's twelfth slot, which keeps rax free for the tail call. WL_LOAD is a
 // ladder, as clang builds the phi cascade of a fallthrough switch in O(n^2).
 
+// A generic jump (FID_ENTER, Clo~apply, FID_EXIT) fills words from memory
+// before a musttail. Through the ladder every word of the bank may be set,
+// so the host passes all of them, on the stack past the argument registers:
+// a 175-word bank made each closure call copy 175 words. Below WL_FANS
+// words, a case per count sets just its words and jumps, leaving the rest
+// undefined; the device's switch keeps the ladder. FID_EXIT saves only the
+// words its return carries.
+const WL_FANS = 16;
+
+function wl_fans(rs: string[], resw: number): string[] {
+  const fan = (k: number, name: string, ps: string, get: (i: number) => string,
+    last: (n: number) => string, jump: string, ladder: string): string => {
+    const cs = [...Array(k).keys()].map((n) =>
+      `    case ${n}: { ${[...Array(n).keys()].map(get).join(" ")} ${last(n)} ${jump} } \\\n`);
+    return `#if DEVICE\n#define ${name}(${ps}) ${ladder}\n#else\n#define ${name}(${ps}) \\\n`
+      + `  switch (FN) { \\\n${cs.join("")}    default: { ${ladder} } \\\n  }\n#endif`;
+  };
+  const mem = (i: number) => `${rs[i]} = e.mem[(A) + ${i}];`;
+  const ks = Math.min(WL_FANS, resw + 1);
+  const save = [...Array(ks).keys()].map((n) => `    case ${n}: ${[...Array(n)
+    .keys()].map((i) => `(V)[${i}] = ${rs[i]};`).join(" ")} break; \\\n`);
+  return [
+    fan(Math.min(WL_FANS, rs.length + 1), "WL_FAN_LOAD", "A, FN, PRE, F", mem, () => "PRE;", "WL_DYN(F);",
+      "WL_LOAD(A, FN) PRE; WL_DYN(F);"), "",
+    fan(Math.min(WL_FANS, rs.length + 1), "WL_FAN_APPLY", "A, FN, X, PRE, F", mem,
+      (n) => n < rs.length ? `${rs[n]} = (X); PRE;` : "PRE;", "WL_DYN(F);",
+      "WL_LOAD(A, FN) PRE; WL_LAST(X) WL_DYN(F);"), "",
+    fan(Math.min(WL_FANS, resw + 1), "WL_FAN_TAKE", "V, FN, JUMP", (i) => `${rs[i]} = (V)[${i}];`, () => "",
+      "JUMP;", "WL_TAKE(V) JUMP;"), "",
+    `#if DEVICE\n#define WL_FAN_SAVE(V, FN) WL_SAVE(V)\n#else\n#define WL_FAN_SAVE(V, FN) \\\n`
+      + `  switch (FN) { \\\n${save.join("")}    default: WL_SAVE(V) break; \\\n  }\n#endif`, ""];
+}
+
 export function compile_book(book: Bend.Book): string {
   FL = file_new(book, false);
   // a pure main's descriptor names constructors of the types it prints,
@@ -2895,6 +2928,7 @@ export function compile_book(book: Bend.Book): string {
     `(V)[${j}] = ${r};`).join(" ")}`, "",
   `#define WL_TAKE(V) ${rs.slice(0, resw).map((r, j) =>
     `${r} = (V)[${j}];`).join(" ")}`, "",
+  ...wl_fans(rs, resw),
   `#define WL_SIG Env e, DEV Term* sp, u32 seq, u32 rn, ${ws.map((w) =>
     "Term " + w).join(", ")}`, "", `#define WL_ALL e, sp, seq, rn, ${ws
     .join(", ")}`, "",
@@ -5103,13 +5137,11 @@ ${segs}
     seq |= fid_nofk(f) << 1;
     u32 rw = fid_resw(f);
     if (rw) {
-      WL_LOAD(a + war - rw, rw)
       WL_ARGS(a, war - rw + 1)
+      WL_FAN_LOAD(a + war - rw, rw, heap_free(e, cls_fit(war + 2), a), f)
     } else {
-      WL_LOAD(a, war)
+      WL_FAN_LOAD(a, war, heap_free(e, cls_fit(war + 2), a), f)
     }
-    heap_free(e, cls_fit(war + 2), a);
-    WL_DYN(f);
   }}
 
   WL_CASE(FID(IO~emit))
@@ -5130,17 +5162,14 @@ ${segs}
     u32 f    = (u32)term_aux(fun);
     u32 war  = fid_arity(f) - 1;
     u64 a    = term_loc(fun);
-    WL_LOAD(a, war)
-    spare_free(e, cls_fit(war), a);
-    WL_LAST(arg)
-    WL_DYN(f);
+    WL_FAN_APPLY(a, war, arg, spare_free(e, cls_fit(war), a), f)
   }}
 
   WL_CASE(FID_EXIT)
   {
     u32  n = rn;
     Term rv[WL_RESW];
-    WL_SAVE(rv)
+    WL_FAN_SAVE(rv, n)
     WL_OPEN
     if (err_seen(e.mem)) {
       return 0;
@@ -5152,8 +5181,7 @@ ${segs}
     if (cont != TERM_HOLE && wf == FID_EXIT) {
       WL_ARGS(term_loc(cont), idx + 1)
       heap_free(e, cls_fit(STAK_LEN), term_loc(cont));
-      WL_TAKE(rv)
-      WL_RETN(n);
+      WL_FAN_TAKE(rv, n, WL_RETN(n))
     }
     if (cont != TERM_HOLE && fid_resw(wf)) {
       u64 wa = term_loc(cont);
@@ -5162,8 +5190,7 @@ ${segs}
       seq = (seq & 1) | fid_nofk(wf) << 1;
       WL_ARGS(wa, wn - n + 1)
       heap_free(e, cls_fit(wn + 2), wa);
-      WL_TAKE(rv)
-      WL_DYN(wf);
+      WL_FAN_TAKE(rv, n, WL_DYN(wf))
     }
     return task_deliver(e.mem, cont, idx, rv, n);
   }}
