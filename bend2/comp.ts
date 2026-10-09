@@ -248,6 +248,7 @@ const OPERATIONS: Record<string, Intr> = Object.setPrototypeOf({
     swap: "array_rmw($0, $1, () => $2)",
     size: "{$: \"Tuple\", fst: $0, snd: $0.length}",
   }).map(([k, JS]) => ["array_" + k, { C: null, JS }])),
+  array_q4mv: { C: ["$0", "$1", "q4mv(e, $0, $1, $2, $3, $4, $5, $6)"] },
   array_clone: {
     C:  ["$0", "blk_copy(e, $0)"],
     JS: "{$: \"Tuple\", fst: $0, snd: $0.slice()}",
@@ -810,7 +811,7 @@ function intr_of(k: Name, js = false): Intr | undefined {
   const tld = FL.book.tlds[k];
   const it = tld?.$ === "Def" && tld.i === undefined && tld.b
     ? OPERATIONS[op_name(k)] : undefined;
-  return it && (js || it.C !== undefined) ? it : undefined;
+  return it && (js ? it.JS : it.C) !== undefined ? it : undefined;
 }
 
 function op_name(k: Name): string {
@@ -1413,7 +1414,7 @@ function file_book(roots: Name[]): void {
         if (s.b) {
           FL.bangs.add(s.k);
         }
-        if (intr_of(s.k) === undefined) {
+        if (intr_of(s.k, FL.js) === undefined) {
           refs.add(s.k);
           FL.sites.set(s.k, (FL.sites.get(s.k) ?? 0) + 1);
         }
@@ -4219,6 +4220,47 @@ INLINE Term blk_new(Env e, bool arr, u64 d, u32 lgs, u32 n, THR Term* v) {
     blk_write(H, arr, l, (u32)i, i % (1u << lgs) < n ? v[i % (1u << lgs)] : 0);
   }
   return term_blk(arr, c, l);
+}
+
+// Array.q4mv sums eight rows side by side, each its own chain of adds in
+// base.bend's order: a vector lane holds a row, and no sum is reordered.
+#define Q4_H(u) f32_unbox(g & 1 ? (u) & 0xFFFF0000u : (u) << 16)
+
+INLINE Term q4mv(Env e, Term w, Term x, Term y, u32 r, u32 n, u32 c, u32 rs) {
+  DEV u32a* W = blk_ptr(e.mem, blk_loc(e.mem, w), 0);
+  DEV u32a* X = blk_ptr(e.mem, blk_loc(e.mem, x), 0);
+  DEV u32a* Y = blk_ptr(e.mem, blk_loc(e.mem, y), 0);
+  u32 wm = (1ull << blk_cls(w)) - 1, xm = (1ull << blk_cls(x)) - 1;
+  u32 cw = c >> 3, sw = c >> 7;
+  for (u32 i = r; i < r + n; i += 8) {
+    f32 a[8] = {0};
+    for (u32 g = 0; g < c >> 6; g += 1) {
+      f32 q[8] = {0};
+      for (u32 k = 0; k < 64; k += 8) {
+        u32 o[8];
+        for (u32 b = 0; b < 8; b += 1) {
+          o[b] = W[((i + b) * cw + g * 8 + k / 8) & wm];
+        }
+        for (u32 j = 0; j < 8; j += 1) {
+          f32 v = f32_unbox(X[(g * 64 + k + j) & xm]);
+          for (u32 b = 0; b < 8; b += 1) {
+            q[b] += (f32)(o[b] >> 4 * j & 15) * v;
+          }
+        }
+      }
+      for (u32 b = 0; b < 8; b += 1) {
+        u32 t = rs * cw + (i + b) * sw + g / 2;
+        a[b] += Q4_H(W[t & wm]) * q[b];
+        a[b] += Q4_H(W[(t + rs * sw) & wm]) * f32_unbox(X[(c + g) & xm]);
+      }
+    }
+    for (u32 b = 0; b < 8 && i + b < r + n; b += 1) {
+      u32 u = (u32)f32_rewrap(a[b]);
+      Y[(i + b) & ((1ull << blk_cls(y)) - 1)] = ((u & 0x7FFFFFFFu) > 0x7F800000u
+        ? u >> 16 & 0x8000u | 0x7FFFu : (u + 0x7FFFu + (u >> 16 & 1)) >> 16) << 16;
+    }
+  }
+  return y;
 }
 
 // Ring
