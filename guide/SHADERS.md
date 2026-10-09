@@ -266,3 +266,52 @@ slowdown). Probe without audio: it wakes `audiomxd` at 70-100% of a core.
 `demos/app_slash_boss_3d/bend3d.bend` is the library; its comments are these
 rules at their sites. `main.bend` beside it is the app, with `Play.loop` and the
 probes.
+
+
+## Queued CUDA inference arrays
+
+The native CUDA runtime queues `Array.q4go`, `rmsq`, `swq`, `gdn`, `atq`
+and `amq` on one ordered stream. `Array.q4emb` reads a row of an MLX
+q4/group-64 matrix as BF16-rounded embedding activations; `Array.roq`
+generates rotary cosines and sines with the Bend FP32 rounding boundaries.
+Their arrays must remain owned and unmodified until `Array.q4wait` returns.
+Host readers must wait first. `Array.q4new` allocates a zero-filled F32
+array whose initialization may be queued or fused into its first CUDA
+writer; CPU, Metal and JS initialize it immediately. `Array.q4cuda()`
+returns 1 only with a live native CUDA heap and 0 on the other backends,
+so an inference package can select CUDA without a general GPU bang.
+
+Build with CUDA headers, driver and NVRTC libraries available through
+`CUDA_HOME`, and run the compiled program with `--gpu <span>`.
+`BEND_Q4_REQUIRE_CUDA=1` refuses unsupported inference geometry rather
+than falling back to host model math. This is a specialized MLX q4g64
+path: attention has at most 4096 positions and a head dimension of at
+most 256. Check each operation's geometry before using another model.
+The CUDA code preserves BF16 rounding and fixed sum order, with FMA
+contraction disabled. The base-library Bend bodies remain the reference
+on other backends; different backend transcendentals can differ.
+
+Optional CUDA environment switches:
+
+- `BEND_Q4_HOST_LINKS=1`: store large-block free links in host memory.
+  This is for inference-only programs; general GPU evaluator passes
+  fail explicitly while it is enabled.
+- `BEND_Q4_IMMUTABLE_PACK=1`: keep an exact transpose of packed q4
+  matrix bits on the device. It costs one extra copy of those matrices.
+- `BEND_Q4_IMMUTABLE_CONST=1`: retain exact device copies of RMS,
+  DeltaNet and attention constants. These two immutable caches require
+  the source arrays to stay alive at stable allocations, unchanged,
+  for the entire process. Do not enable them for mutable arrays or
+  replace/free cached model parameters during the process.
+- `BEND_Q4_GRAPH=1`: replay the same token kernels through an updated
+  CUDA graph. It is off by default; profiling uses direct launches.
+- `BEND_Q4_TRACE=1`: print queue counts to stderr.
+- `BEND_Q4_PROFILE=1`: print CUDA event timings; leave it unset when
+  measuring normal throughput.
+
+The pure rotary table cache covers positions below 2048 and computes
+larger positions directly on CUDA. The immutable caches are opt-in and
+released with the process. The tests in `tests/base/array_q4mv.bend`,
+`array_q4mv_tree`, `array_rmsq`, `array_swq`, `array_gdn`, `array_atq`,
+`array_amq`, `array_q4new`, `array_q4emb` and `array_roq` specify expected
+bit patterns, queued ownership and initialization behavior.

@@ -2641,6 +2641,62 @@ def Array.q4mv(w: Array<U32>, x: Array<F32>, y: Array<F32>, +r: U32, +n: U32, +c
 def Array.q4go(w: Array<U32>, x: Array<F32>, y: Array<F32>, +r: U32, +n: U32, +cols: U32, +rows: U32) -> (Array<U32> & Array<F32>) & Array<F32>:
   Array.q4mv(w, x, y, r, n, cols, rows)
 
+# Queued RoPE cosines followed by sines; host readers wait with q4wait.
+def Array.roq.go(n: Nat, o: Array<F32>, +i: U32, +half: U32, +pos: U32, +base: F32) -> Array<F32>:
+  match n:
+    case 0n:
+      o
+    case 1n+p:
+      +t = (U32.to_f32(pos) * F32.pow(base, F32.neg((U32.to_f32(i) / U32.to_f32(half) : F32))) : F32)
+      Array.roq.go(p, Array.set(F32, Array.set(F32, o, i, F32.cos(t)), (half + i : U32), F32.sin(t)),
+        (i + 1 : U32), half, pos, base)
+
+def Array.roq(o: Array<F32>, +half: U32, +pos: U32, +base: F32) -> Array<F32>:
+  Array.roq.go(U32.to_nat(half), o, 0, half, pos, base)
+
+# A row of an MLX affine q4g64 matrix as BF16-rounded embeddings. A
+# native CUDA heap queues it; keep w and o until q4wait before CPU reads.
+def Array.q4emb.code(r: Array<U32> & U32, o: Array<F32>, +i: U32, +sc: F32, +bi: F32) -> Array<U32> & Array<F32>:
+  (w, +q) = r
+  +n = ((q >> U32.to_nat(((i .&. 7) * 4 : U32))) .&. 15 : U32)
+  (w, Array.set(F32, o, i, Array.q4mv.round((sc * U32.to_f32(n) + bi : F32))))
+
+def Array.q4emb.bias(r: Array<U32> & U32, o: Array<F32>, +i: U32, +code: U32, +sc: U32, +even: Bool) ->
+  Array<U32> & Array<F32>:
+  (w, +bi) = r
+  Array.q4emb.code(Array.get(U32, w, code), o, i, Array.q4mv.half(even, sc), Array.q4mv.half(even, bi))
+
+def Array.q4emb.scale(r: Array<U32> & U32, o: Array<F32>, +i: U32, +code: U32, +bias: U32) -> Array<U32> & Array<F32>:
+  (w, +sc) = r
+  Array.q4emb.bias(Array.get(U32, w, bias), o, i, code, sc, U32.is_zero(((i >> 6n) .&. 1 : U32)))
+
+def Array.q4emb.go(n: Nat, r: Array<U32> & Array<F32>, +i: U32, +row: U32, +cols: U32, +rows: U32) ->
+  Array<U32> & Array<F32>:
+  match n:
+    case 0n:
+      r
+    case 1n+p:
+      (w, o) = r
+      +cw = (cols >> 3n : U32)
+      +sw = (cols >> 7n : U32)
+      +at = (rows * cw + row * sw + (i >> 7n) : U32)
+      Array.q4emb.go(p, Array.q4emb.scale(Array.get(U32, w, at), o, i, (row * cw + (i >> 3n) : U32),
+        (at + rows * sw : U32)), (i + 1 : U32), row, cols, rows)
+
+def Array.q4emb(w: Array<U32>, o: Array<F32>, +row: U32, +cols: U32, +rows: U32) -> Array<U32> & Array<F32>:
+  Array.q4emb.go(U32.to_nat(cols), (w, o), 0, row, cols, rows)
+
+# Like Array.new(F32, d, 0.0), but a native CUDA heap may queue the zero
+# fill beside q4go. Keep the array until q4wait before any CPU access.
+# Other backends initialize it immediately.
+def Array.q4new(+d: Nat) -> Array<F32>:
+  Array.new(F32, d, 0.0)
+
+# One when a native CUDA inference heap is live; zero on CPU/Metal/JS.
+# This lets a kernel package choose CUDA without running a general bang.
+def Array.q4cuda() -> U32:
+  0
+
 # Array.q4wait(x) is x, once every queued Array.q4go has run.
 def Array.q4wait(x: Array<F32>) -> Array<F32>:
   x

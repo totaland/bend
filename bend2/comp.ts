@@ -251,6 +251,10 @@ const OPERATIONS: Record<string, Intr> = Object.setPrototypeOf({
   array_q4mv: { C: ["$0", "$1", "q4mv(e, $0, $1, $2, $3, $4, $5, $6, 0)"] },
   array_q4go: { C: ["$0", "$1", "q4mv(e, $0, $1, $2, $3, $4, $5, $6, 1)"] },
   array_q4wait: { C: "q4wait($0)" },
+  array_q4new: { C: "q4new(e, $0)" },
+  array_q4cuda: { C: "q4cuda()" },
+  array_roq: { C: "roq(e, $0, $1, $2, $3)" },
+  array_q4emb: { C: ["$0", "q4emb(e, $0, $1, $2, $3, $4)"] },
   array_amq: { C: ["$0", "amq(e, $0, $1, $2)"] },
   array_rmsq: { C: ["$0", "$1", "$2", "rmsq(e, $0, $1, $2, $3, $4, $5, $6)"] },
   array_swq: { C: ["$0", "swq(e, $0, $1, $2)"] },
@@ -2880,7 +2884,7 @@ export function compile_book(book: Bend.Book): string {
   `CONSTV u8 CID_T[][2] = { ${[...cids.keys()].map((k, i) =>
     `{ ${ars[i]}, ${Number(FL.hot.has(k))} }`).join(", ")} };`,
   `#define STAT_LEN ${FL.img.length}`, "",
-  `#define WL_RESW ${resw}`, `#define BANGS   ${FL.bangs.size}`, "",
+  `#define WL_RESW ${resw}`, `#define BANGS   ${FL.bangs.size}`, `#define Q4_GPU ${Number([...FL.segs, ...FL.spins].some(s => /\b(q4mv|q4new|q4emb|roq|rmsq|swq|gdn|atq|amq)\(e[,)]|\bq4cuda\(\)/.test(s.lines.join("\n"))))}`, "",
   `#define WL_BANK Term ${ws.join(", ")};`, "",
   `#define WL_LOAD(A, N) \\\n  do { \\\n${rs.map((r, i) =>
     `    if ((N) <= ${i}) break; ${r} = e.mem[(A) + ${i}]; \\\n`).join("")
@@ -3603,6 +3607,19 @@ static id<MTLBuffer> gpu_amscratch;
 static CUdevice   gpu_dev;
 static CUmodule   gpu_lib;
 static CUfunction gpu_pso;
+static CUcontext gpu_ctx;
+static CUfunction gpu_empso, gpu_ropso, gpu_pkpso, gpu_t4pso, gpu_rbpso, gpu_rcpso;
+static u64* gpu_host_links;
+static u64 gpu_host_links_n;
+static u32 gpu_qzeros;
+static CUstream gpu_qstream;
+static CUfunction gpu_q4pso, gpu_rmpso, gpu_swpso, gpu_gdpso, gpu_atpso;
+static CUfunction gpu_ampso, gpu_amfpso;
+static CUdeviceptr gpu_amscratch;
+static pthread_mutex_t gpu_qlock = PTHREAD_MUTEX_INITIALIZER;
+static u32 gpu_qk;
+static CUevent gpu_qev[256][2];
+static u32 gpu_qei, gpu_qtype[256];
 #endif
 static bool io_gpu;
 static DEV Term*  io_stk;
@@ -3844,6 +3861,28 @@ OUTLINE void heap_hand(Env e, u32 cls) {
 static bool corpus_grow(u64* H, u64 need);
 #endif
 
+// In inference-only CUDA mode, large-block free links live in CPU memory.
+// Touching a link must not pull a GPU activation page back to the CPU.
+INLINE u64 heap_link_get(DEV u64* H, u64 loc, u32 cls) {
+#if !DEVICE && BEND_CUDA
+  if (gpu_host_links && cls >= 8) {
+    if ((loc >> 8) >= gpu_host_links_n) err_fail("CUDA heap link out of bounds");
+    return gpu_host_links[loc >> 8];
+  }
+#endif
+  return H[loc];
+}
+INLINE void heap_link_set(DEV u64* H, u64 loc, u32 cls, u64 next) {
+#if !DEVICE && BEND_CUDA
+  if (gpu_host_links && cls >= 8) {
+    if ((loc >> 8) >= gpu_host_links_n) err_fail("CUDA heap link out of bounds");
+    gpu_host_links[loc >> 8] = next;
+    return;
+  }
+#endif
+  H[loc] = next;
+}
+
 OUTLINE u64 heap_alloc_miss(Env e, u32 cls) {
   DEV u64* H = e.mem;
   u64  got = 0;
@@ -3865,10 +3904,10 @@ OUTLINE u64 heap_alloc_miss(Env e, u32 cls) {
     }
     got = HEAP_OFF + ((u64)p << PAGE_BITS);
     for (u32 i = 1; i <= n; i += 1) {
-      H[got + ((u64)(i - 1) << cls)] = i < n ? got + ((u64)i << cls) : 0;
+      heap_link_set(H, got + ((u64)(i - 1) << cls), cls, i < n ? got + ((u64)i << cls) : 0);
     }
   }
-  ALC_AT(e, cls)  = H[got];
+  ALC_AT(e, cls)  = heap_link_get(H, got, cls);
   ALC_LEN(e, cls) = (u64)(n - 1) << cls;
   return got;
 }
@@ -3876,7 +3915,7 @@ OUTLINE u64 heap_alloc_miss(Env e, u32 cls) {
 INLINE u64 heap_alloc(Env e, u32 cls) {
   u64 h = ALC_AT(e, cls);
   if (h) {
-    ALC_AT(e, cls)   = e.mem[h];
+    ALC_AT(e, cls)   = heap_link_get(e.mem, h, cls);
     ALC_LEN(e, cls) -= 1ull << cls;
     return h;
   }
@@ -3887,7 +3926,7 @@ INLINE void heap_free(Env e, u32 cls, u64 loc) {
   if (err_peek(e.mem)) {
     return;
   }
-  e.mem[loc]       = ALC_AT(e, cls);
+  heap_link_set(e.mem, loc, cls, ALC_AT(e, cls));
   ALC_AT(e, cls)   = loc;
   ALC_LEN(e, cls) += 1ull << cls;
   if (!DEVICE && ALC_LEN(e, cls) >= KEEP_WORDS) {
@@ -4259,6 +4298,34 @@ INLINE Term blk_new(Env e, bool arr, u64 d, u32 lgs, u32 n, THR Term* v) {
   return term_blk(arr, c, l);
 }
 
+#if !DEVICE && BEND_CUDA
+static void gpu_qzero(u64 loc, u64 words);
+#endif
+// Backend selection for an inference package: do not launch a general bang
+// merely to discover CUDA, especially with host-only large-block links.
+INLINE Term q4cuda(void) {
+#if !DEVICE && BEND_CUDA
+  return io_gpu ? 1 : 0;
+#else
+  return 0;
+#endif
+}
+
+// CUDA's queued zero initialization: keep the result through q4wait before
+// reading it on the CPU, just as for q4go's queued output.
+INLINE Term q4new(Env e, u64 d) {
+  if (d > 31) err_post(e.mem, ERR_ARRS);
+#if !DEVICE && BEND_CUDA
+  if (io_gpu) {
+    BLK_ALLOC(loc, d == 0 ? 0 : (u32)d - 1)
+    gpu_qzero(loc, d == 0 ? 2 : 1ull << d);
+    return term_blk(false, (u32)d, loc);
+  }
+#endif
+  Term zero[1] = {0};
+  return blk_new(e, false, d, 0, 1, zero);
+}
+
 // Array.q4mv: rows r .. r+n of an MLX affine q4g64 matrix against x, each
 // row summed in base.bend's tree order and narrowed to bfloat16 into y.
 
@@ -4317,11 +4384,15 @@ INLINE u32 q4_row(DEV u32a* W, DEV u32a* X, u32 wm, u32 xm, u32 i, u32 c,
 
 // The host hands a big product to the GPU's own kernel (a SIMD group a row)
 // when a Metal heap is live; Q4_GPU_MIN weights is the break-even.
+#if BEND_CUDA
+#define Q4_GPU_MIN 0
+#else
 #define Q4_GPU_MIN (1ull << 22)
+#endif
 #ifndef Q4R
 #define Q4R 4
 #endif
-#if !DEVICE && BEND_METAL
+#if !DEVICE && (BEND_METAL || BEND_CUDA)
 static bool gpu_q4mv(u64 wl, u64 xl, u64 yl, u32 wm, u32 xm, u32 ym, u32 r,
   u32 n, u32 c, u32 rows, bool q);
 static void gpu_q4wait(void);
@@ -4376,6 +4447,53 @@ INLINE void q4_neon4(const u32* W, const f32* X, u32* Y, u32 i, u32 c,
 
 // q (Array.q4go): a GPU product joins the open queue, any size, and y holds
 // it only after the next Array.q4wait.
+#if !DEVICE && BEND_CUDA
+static bool gpu_qemb(u64 w, u64 o, u32 wm, u32 om, u32 r, u32 c, u32 rows);
+#endif
+#if !DEVICE && BEND_CUDA
+static bool gpu_roq(u64 o, u32 om, u32 half, u32 pos, u32 base);
+#endif
+INLINE Term roq(Env e, Term o, u64 half, u64 pos, u64 base) {
+  u64 no=1ull<<blk_cls(o);
+  bool fit=half<=256 && half*2<=no && pos<=0xffffffffu;
+#if !DEVICE && BEND_CUDA
+  if (fit && gpu_roq(blk_loc(e.mem,o),(u32)(no-1),(u32)half,(u32)pos,(u32)base)) return o;
+  if (io_gpu && getenv("BEND_Q4_REQUIRE_CUDA")) err_fail("roq shape is unsupported on CUDA");
+#endif
+  if (!fit) return o;
+  DEV u32a* O=blk_ptr(e.mem,blk_loc(e.mem,o),0);
+  for (u32 j=0;j<(u32)half;j+=1) {
+    f32 t=(f32)pos*(f32)pow((double)f32_unbox((u32)base),(double)(-(f32)j/(f32)half));
+    O[j]=(u32)f32_rewrap((f32)cos((double)t)); O[half+j]=(u32)f32_rewrap((f32)sin((double)t));
+  }
+  return o;
+}
+
+// One MLX affine q4g64 row, rounded to BF16 embedding activations.
+INLINE Term q4emb(Env e, Term w, Term o, u64 row, u64 cols, u64 rows) {
+  DEV u64* H=e.mem;
+  u64 nw=1ull<<blk_cls(w), no=1ull<<blk_cls(o);
+  bool fit=cols>0 && (cols&127)==0 && cols<=no && row<rows
+    && rows<=0xffffffffu && cols<=0xffffffffu
+    && rows*((cols>>3)+2*(cols>>7))<=nw;
+#if !DEVICE && BEND_CUDA
+  if (fit && gpu_qemb(blk_loc(H,w),blk_loc(H,o),(u32)(nw-1),(u32)(no-1),
+      (u32)row,(u32)cols,(u32)rows)) return o;
+  if (io_gpu && getenv("BEND_Q4_REQUIRE_CUDA"))
+    err_fail("q4emb shape is unsupported on CUDA");
+#endif
+  if (!fit) return o;
+  DEV u32a* W=blk_ptr(H,blk_loc(H,w),0);
+  DEV u32a* O=blk_ptr(H,blk_loc(H,o),0);
+  u32 c=(u32)cols, cw=c>>3, sw=c>>7;
+  for (u32 j=0;j<c;j+=1) {
+    u32 g=j>>6, at=(u32)rows*cw+(u32)row*sw+(g>>1);
+    u32 q=(W[(u32)row*cw+(j>>3)]>>(4*(j&7)))&15;
+    O[j]=q4_round(q4_half(W[at],g)*(f32)q + q4_half(W[at+(u32)rows*sw],g));
+  }
+  return o;
+}
+
 INLINE Term q4mv(Env e, Term w, Term x, Term y, u64 r, u64 n, u64 cols,
   u64 rows, bool q) {
   DEV u64*  H  = e.mem;
@@ -4394,10 +4512,15 @@ INLINE Term q4mv(Env e, Term w, Term x, Term y, u64 r, u64 n, u64 cols,
   u64 t  = 0;
   bool fit = (u64)rows * (cw + 2 * sw) <= (u64)wm + 1
     && (u64)c + (c >> 6) <= (u64)xm + 1 && r + n <= (u64)ym + 1 && r + n <= rows;
-#if !DEVICE && BEND_METAL
+#if !DEVICE && (BEND_METAL || BEND_CUDA)
   if (fit && (q || n * cols >= Q4_GPU_MIN) && gpu_q4mv(blk_loc(H, w),
       blk_loc(H, x), blk_loc(H, y), wm, xm, ym, i, (u32)n, c, (u32)rows, q)) {
     return y;
+  }
+#endif
+#if !DEVICE && BEND_CUDA
+  if (io_gpu && getenv("BEND_Q4_REQUIRE_CUDA")) {
+    err_fail("CUDA q4mv geometry is unsupported; CPU fallback refused");
   }
 #endif
 #if !DEVICE && defined(__ARM_NEON)
@@ -4411,7 +4534,7 @@ INLINE Term q4mv(Env e, Term w, Term x, Term y, u64 r, u64 n, u64 cols,
   return y;
 }
 
-#if !DEVICE && BEND_METAL
+#if !DEVICE && (BEND_METAL || BEND_CUDA)
 static bool gpu_amq(u64 xl, u64 ol, u32 n);
 #endif
 INLINE Term amq(Env e, Term x, Term o, u64 n) {
@@ -4419,12 +4542,17 @@ INLINE Term amq(Env e, Term x, Term o, u64 n) {
   DEV u32a* X = blk_ptr(H, blk_loc(H, x), 0);
   DEV u32a* O = blk_ptr(H, blk_loc(H, o), 0);
   u64 xm = (1ull << blk_cls(x)) - 1;
-#if !DEVICE && BEND_METAL
+#if !DEVICE && (BEND_METAL || BEND_CUDA)
   if (n <= xm + 1 && blk_cls(o) >= 1 && n <= 0xffffffffull &&
       gpu_amq(blk_loc(H, x), blk_loc(H, o), (u32)n)) {
     return o;
   }
   gpu_q4wait();
+#endif
+#if !DEVICE && BEND_CUDA
+  if (io_gpu && getenv("BEND_Q4_REQUIRE_CUDA")) {
+    err_fail("CUDA amq geometry is unsupported; CPU fallback refused");
+  }
 #endif
   u32 bi = 0, bv = n ? X[0] : 0;
   for (u64 i = 1; i < n; i += 1) {
@@ -4443,7 +4571,7 @@ INLINE Term amq(Env e, Term x, Term o, u64 n) {
 
 // Array.rmsq: base.bend's residual add and RMS norm into q4 activations; a
 // Metal heap queues it between the products before and after it.
-#if !DEVICE && BEND_METAL
+#if !DEVICE && (BEND_METAL || BEND_CUDA)
 static bool gpu_rmsq(u64 xl, u64 yl, u64 wl, u64 ol, u32 n, u32 eps, u32 add);
 #endif
 INLINE Term rmsq(Env e, Term x, Term y, Term w, Term o, u64 n, u64 eps,
@@ -4456,10 +4584,15 @@ INLINE Term rmsq(Env e, Term x, Term y, Term w, Term o, u64 n, u64 eps,
   u64 c = 1ull << blk_cls(x);
   bool fit = n <= c && (n & 63) == 0 && n <= 1ull << blk_cls(w)
     && (!add || n <= 1ull << blk_cls(y)) && n + (n >> 6) <= 1ull << blk_cls(o);
-#if !DEVICE && BEND_METAL
+#if !DEVICE && (BEND_METAL || BEND_CUDA)
   if (fit && gpu_rmsq(blk_loc(H, x), blk_loc(H, y), blk_loc(H, w),
       blk_loc(H, o), (u32)n, (u32)eps, (u32)add)) {
     return o;
+  }
+#endif
+#if !DEVICE && BEND_CUDA
+  if (io_gpu && getenv("BEND_Q4_REQUIRE_CUDA")) {
+    err_fail("CUDA rmsq geometry is unsupported; CPU fallback refused");
   }
 #endif
   if (!fit) {
@@ -4489,7 +4622,7 @@ INLINE Term rmsq(Env e, Term x, Term y, Term w, Term o, u64 n, u64 eps,
 
 // Array.swq and Array.gdn: base.bend's SwiGLU and gated DeltaNet step into
 // q4 activations; a Metal heap queues them like Array.rmsq.
-#if !DEVICE && BEND_METAL
+#if !DEVICE && (BEND_METAL || BEND_CUDA)
 static bool gpu_swq(u64 al, u64 ol, u32 n);
 static bool gpu_gdn(const u64* at, const u32* p);
 #endif
@@ -4519,9 +4652,14 @@ INLINE Term swq(Env e, Term a, Term o, u64 n) {
   DEV u32a* O = blk_ptr(H, blk_loc(H, o), 0);
   bool fit = (n & 63) == 0 && 2 * n <= 1ull << blk_cls(a)
     && n + (n >> 6) <= 1ull << blk_cls(o);
-#if !DEVICE && BEND_METAL
+#if !DEVICE && (BEND_METAL || BEND_CUDA)
   if (fit && gpu_swq(blk_loc(H, a), blk_loc(H, o), (u32)n)) {
     return o;
+  }
+#endif
+#if !DEVICE && BEND_CUDA
+  if (io_gpu && getenv("BEND_Q4_REQUIRE_CUDA")) {
+    err_fail("CUDA swq geometry is unsupported; CPU fallback refused");
   }
 #endif
   for (u32 i = 0; fit && i < n; i += 1) {
@@ -4570,13 +4708,18 @@ INLINE Term gdn(Env e, Term y, Term w, Term s, Term cw, Term ab, Term sn,
     && nvh * dv * dk <= 1ull << blk_cls(s) && 4 * c <= 1ull << blk_cls(cw)
     && 2 * nvh <= 1ull << blk_cls(ab) && dv <= 1ull << blk_cls(sn)
     && din + (din >> 6) <= 1ull << blk_cls(o);
-#if !DEVICE && BEND_METAL
+#if !DEVICE && (BEND_METAL || BEND_CUDA)
   u64 at[7] = { blk_loc(H, y), blk_loc(H, w), blk_loc(H, s), blk_loc(H, cw),
     blk_loc(H, ab), blk_loc(H, sn), blk_loc(H, o) };
   u32 p[8] = { (u32)c, (u32)dk, (u32)dv, (u32)nvh, (u32)din, (u32)eps,
     (u32)ko, 0 };
   if (fit && gpu_gdn(at, p)) {
     return o;
+  }
+#endif
+#if !DEVICE && BEND_CUDA
+  if (io_gpu && getenv("BEND_Q4_REQUIRE_CUDA")) {
+    err_fail("CUDA gdn geometry is unsupported; CPU fallback refused");
   }
 #endif
 #if !DEVICE
@@ -4653,7 +4796,7 @@ INLINE Term gdn(Env e, Term y, Term w, Term s, Term cw, Term ab, Term sn,
 // Metal heap queues it (positions up to ATQ_MAX); past that it runs here at
 // once, so the caller waits first.
 #define ATQ_MAX 4096
-#if !DEVICE && BEND_METAL
+#if !DEVICE && (BEND_METAL || BEND_CUDA)
 static bool gpu_atq(const u64* at, const u32* p);
 #endif
 #if !DEVICE
@@ -4693,12 +4836,17 @@ INLINE Term atq(Env e, Term y, Term kc, Term vc, Term kw, Term cs, Term o,
     && (pos + 1) * st <= 1ull << blk_cls(kc) && (pos + 1) * st <= 1ull << blk_cls(vc)
     && 2 * hd <= 1ull << blk_cls(kw) && 2 * hf <= 1ull << blk_cls(cs)
     && nq * hd + nq * hd / 64 <= 1ull << blk_cls(o);
-#if !DEVICE && BEND_METAL
+#if !DEVICE && (BEND_METAL || BEND_CUDA)
   u64 at[6] = { blk_loc(H, y), blk_loc(H, kc), blk_loc(H, vc), blk_loc(H, kw),
     blk_loc(H, cs), blk_loc(H, o) };
   u32 p[8] = { (u32)pos, (u32)nq, (u32)nkv, (u32)hd, (u32)hf, (u32)eps, 0, 0 };
   if (fit && hd <= 256 && pos < ATQ_MAX && gpu_atq(at, p)) {
     return o;
+  }
+#endif
+#if !DEVICE && BEND_CUDA
+  if (io_gpu && getenv("BEND_Q4_REQUIRE_CUDA")) {
+    err_fail("CUDA atq geometry is unsupported; CPU fallback refused");
   }
 #endif
 #if !DEVICE
@@ -5546,6 +5694,537 @@ kernel void bend_atq(device const u32* Y [[buffer(0)]], device u32* KC [[buffer(
     }
   }
 }
+#else // CUDA inference kernels
+
+// CUDA equivalents of the Metal warp operations. Every reduction broadcasts
+// lane zero so all lanes observe the same normalization factor.
+struct CudaQP { u32 v[10]; };
+INLINE f32 cuda_float(u32 x) { return __uint_as_float(x); }
+INLINE u32 cuda_bits(f32 x) { return __float_as_uint(x); }
+template<class T> INLINE T cuda_down(T x, unsigned int n) {
+  return __shfl_down_sync(0xffffffffu, x, n);
+}
+INLINE f32 cuda_sum(f32 x) {
+  for (u32 n = 16; n; n >>= 1) x += cuda_down(x, n);
+  return __shfl_sync(0xffffffffu, x, 0);
+}
+INLINE f32 cuda_max(f32 x) {
+  for (u32 n = 16; n; n >>= 1) x = fmaxf(x, cuda_down(x, n));
+  return __shfl_sync(0xffffffffu, x, 0);
+}
+// Pending q4new outputs are initialized by their first writer. This
+// loop clears only slots that the operation will leave untouched.
+INLINE void cuda_pad(u32* out, const u32* P, u32 begin, u32 end) {
+  if (!P[8]) return;
+  u64 stride = (u64)gridDim.x * blockDim.x;
+  for (u64 j=(u64)blockIdx.x*blockDim.x+threadIdx.x;j<P[9];j+=stride)
+    if (j<begin || j>=end) out[j]=0;
+}
+// A pure cache of exactly the same FP32-rounded angles, made on CUDA.
+extern "C" __global__ void bend_roq_table(u32* F, CudaQP qp) {
+  const u32* P=qp.v;
+  u32 i=blockIdx.x*blockDim.x+threadIdx.x, half=P[1];
+  if (i>=half*2048) return;
+  u32 j=i%half, pos=i/half;
+  f32 exponent=-(f32)j/(f32)half;
+  f32 frequency=(f32)pow((double)cuda_float(P[3]),(double)exponent);
+  f32 angle=(f32)pos*frequency;
+  F[pos*half*2+j]=cuda_bits((f32)cos((double)angle));
+  F[pos*half*2+half+j]=cuda_bits((f32)sin((double)angle));
+}
+extern "C" __global__ void bend_roq_cached(u32* O, const u32* F, CudaQP qp) {
+  const u32* P=qp.v;
+  u32 j=blockIdx.x*blockDim.x+threadIdx.x, half=P[1];
+  cuda_pad(O,P,0,half*2);
+  if (j>=half) return;
+  O[j&P[0]]=F[P[2]*half*2+j];
+  O[(half+j)&P[0]]=F[P[2]*half*2+half+j];
+}
+extern "C" __global__ void bend_roq(u32* O, CudaQP qp) {
+  const u32* P=qp.v;
+  u32 j=blockIdx.x*blockDim.x+threadIdx.x, half=P[1];
+  cuda_pad(O,P,0,half*2);
+  if (j>=half) return;
+  // Round the exponent, frequency and angle at the same FP32 boundaries
+  // as Bend. Double transcendentals avoid fast intrinsic approximations.
+  f32 exponent=-(f32)j/(f32)half;
+  f32 frequency=(f32)pow((double)cuda_float(P[3]),(double)exponent);
+  f32 angle=(f32)P[2]*frequency;
+  O[j&P[0]]=cuda_bits((f32)cos((double)angle));
+  O[(half+j)&P[0]]=cuda_bits((f32)sin((double)angle));
+}
+extern "C" __global__ void bend_q4emb(const u32* W, u32* O, CudaQP qp) {
+  const u32* P=qp.v;
+  u32 j=blockIdx.x*blockDim.x+threadIdx.x;
+  u32 c=P[3], r=P[2], rows=P[4], cw=c>>3, sw=c>>7;
+  cuda_pad(O,P,0,c);
+  if (j>=c) return;
+  u32 g=j>>6, at=rows*cw+r*sw+(g>>1);
+  u32 atq=r*cw+(j>>3), shift=j&7;
+  if (P[7]) { atq=r*cw+(j>>6)*8+(j&7); shift=(j>>3)&7; }
+  u32 q=(W[atq&P[0]]>>(4*shift))&15;
+  O[j&P[1]]=q4_round(q4_half(W[at&P[0]],g)*(f32)q
+    + q4_half(W[(at+rows*sw)&P[0]],g));
+}
+// Four rows per block. Eight lanes cooperate on each group, preserving
+// its ordered nibble sums and all 32 independent group partials.
+extern "C" __global__ void bend_q4mv(const u32* W, const u32* X, u32* Y, CudaQP qp) {
+  const u32* P=qp.v;
+  u32 t=threadIdx.x, lane=t%32, r=t/32, j=t%8, group=(t%32)/8;
+  u32 row=blockIdx.x*4+r, i=P[6]+row, c=P[3], cw=c>>3, sw=c>>7;
+  u32 ng=c>>6, s0=P[4]*cw, d=P[4]*sw;
+  cuda_pad(Y,P,P[6],P[6]+P[7]);
+  __shared__ f32 partial[128];
+  #pragma unroll 1
+  for (u32 part=0;part<8;part+=1) {
+    f32 v=0.0f;
+    for (u32 base=0;base<ng;base+=32) {
+      u32 g=base+group+part*4;
+      f32 acc=0.0f;
+      #pragma unroll
+      for (u32 k=0;k<8;k+=1) {
+        if (g<ng && row<P[7]) {
+          u32 q=W[(i*cw+g*8+k)&P[0]];
+          acc+=(f32)((q>>(4*j))&15)*cuda_float(X[(g*64+k*8+j)&P[1]]);
+        }
+      }
+      u32 l0=lane&~7u;
+      f32 a0=__shfl_sync(0xffffffffu,acc,l0), a1=__shfl_sync(0xffffffffu,acc,l0+1);
+      f32 a2=__shfl_sync(0xffffffffu,acc,l0+2), a3=__shfl_sync(0xffffffffu,acc,l0+3);
+      f32 a4=__shfl_sync(0xffffffffu,acc,l0+4), a5=__shfl_sync(0xffffffffu,acc,l0+5);
+      f32 a6=__shfl_sync(0xffffffffu,acc,l0+6), a7=__shfl_sync(0xffffffffu,acc,l0+7);
+      if (g<ng && row<P[7]) {
+        f32 qx=((a0+a4)+(a2+a6))+((a1+a5)+(a3+a7));
+        u32 at=s0+i*sw+(g>>1);
+        v+=q4_half(W[at&P[0]],g)*qx + q4_half(W[(at+d)&P[0]],g)*cuda_float(X[(c+g)&P[1]]);
+      }
+    }
+    if (j==0) partial[r*32+group+part*4]=v;
+  }
+  __syncthreads();
+  if (true) {
+    f32 out=cuda_sum(partial[r*32+lane]);
+    if (lane==0 && row<P[7]) Y[i&P[2]]=q4_round(out);
+  }
+}
+// Bit transpose only: metadata and floating-point arithmetic are unchanged.
+extern "C" __global__ void bend_q4pack(const u32* W, u32* T, CudaQP qp) {
+  const u32* P=qp.v;
+  u64 i=(u64)blockIdx.x*blockDim.x+threadIdx.x;
+  if (i >= (u64)P[4]*(P[3]>>3)) return;
+  u64 base=i&~7ull;
+  u32 lane=(u32)i&7, out=0;
+  #pragma unroll
+  for (u32 k=0;k<8;k+=1) out|=((W[(base+k)&P[0]]>>(lane*4))&15)<<(k*4);
+  T[i]=out;
+}
+extern "C" __global__ void bend_q4mv_t8(const u32* W, const u32* X, u32* Y, CudaQP qp) {
+  const u32* P=qp.v;
+  u32 t=threadIdx.x, lane=t%32, r=t/32, j=t%8, group=(t%32)/8;
+  u32 row=blockIdx.x*4+r, i=P[6]+row, c=P[3], cw=c>>3, sw=c>>7;
+  u32 ng=c>>6, s0=P[4]*cw, d=P[4]*sw;
+  cuda_pad(Y,P,P[6],P[6]+P[7]);
+  __shared__ f32 partial[128];
+  #pragma unroll 1
+  for (u32 part=0;part<8;part+=1) {
+    f32 v=0.0f;
+    for (u32 base=0;base<ng;base+=32) {
+      u32 g=base+group+part*4;
+      f32 acc=0.0f;
+      u32 q=(g<ng && row<P[7])?W[(i*cw+g*8+j)&P[0]]:0;
+      #pragma unroll
+      for (u32 k=0;k<8;k+=1) {
+        if (g<ng && row<P[7]) {
+          acc+=(f32)((q>>(4*k))&15)*cuda_float(X[(g*64+k*8+j)&P[1]]);
+        }
+      }
+      // Lane zero retains the original pair/add order with three shuffles.
+      f32 qx=acc+__shfl_xor_sync(0xffffffffu,acc,4);
+      qx=qx+__shfl_xor_sync(0xffffffffu,qx,2);
+      qx=qx+__shfl_xor_sync(0xffffffffu,qx,1);
+      if (j==0 && g<ng && row<P[7]) {
+        u32 at=s0+i*sw+(g>>1);
+        v+=q4_half(W[at&P[0]],g)*qx + q4_half(W[(at+d)&P[0]],g)*cuda_float(X[(c+g)&P[1]]);
+      }
+    }
+    if (j==0) partial[r*32+group+part*4]=v;
+  }
+  __syncthreads();
+  if (true) {
+    f32 out=cuda_sum(partial[r*32+lane]);
+    if (lane==0 && row<P[7]) Y[i&P[2]]=q4_round(out);
+  }
+}
+INLINE u32 amq_order_key(u32 v) {
+  v = (v & 0x7fffffffu) == 0 ? 0 : v;
+  return v & 0x80000000u ? ~v : v ^ 0x80000000u;
+}
+
+struct AMQ {
+  u32 first, last, bits, nan;
+};
+
+INLINE AMQ amq_pick(AMQ a, AMQ b) {
+  u32 bad = a.nan | b.nan;
+  u32 x = amq_order_key(a.bits), y = amq_order_key(b.bits);
+  if (b.first != 0xffffffffu && (a.first == 0xffffffffu || y > x)) {
+    a = b;
+  } else if (y == x && b.first != 0xffffffffu) {
+    a.first = min(a.first, b.first);
+    if (b.last > a.last) { a.last = b.last; a.bits = b.bits; }
+  }
+  a.nan = bad;
+  return a;
+}
+
+INLINE AMQ amq_simd(AMQ a) {
+  for (unsigned short s = 16; s > 0; s >>= 1) {
+    a = amq_pick(a, AMQ{cuda_down(a.first, s),
+      cuda_down(a.last, s), cuda_down(a.bits, s),
+      cuda_down(a.nan, s)});
+  }
+  return a;
+}
+
+extern "C" __global__ void bend_amq(const u32* X, AMQ* A, CudaQP qp) {
+  const u32* P = qp.v;
+  u32 tg = blockIdx.x;
+  u32 t = threadIdx.x;
+  u32 sg = threadIdx.x / 32;
+  u32 l = threadIdx.x % 32;
+
+  __shared__ AMQ ps[8];
+  AMQ a{0xffffffffu, 0, 0xff800000u, 0};
+  for (u64 i = ((u64)tg * 256 + t) * 4; i < P[0]; i += (u64)P[1] * 1024) {
+    for (u32 j = 0; j < 4 && i + j < P[0]; j += 1) {
+      u32 v = X[i + j];
+      a = amq_pick(a, AMQ{(u32)i + j, (u32)i + j, v,
+        (v & 0x7fffffffu) > 0x7f800000u});
+    }
+  }
+  a = amq_simd(a);
+  if (l == 0) { ps[sg] = a; }
+  __syncthreads();
+  if (sg == 0) {
+    a = l < 8 ? ps[l] : AMQ{0xffffffffu, 0, 0xff800000u, 0};
+    a = amq_simd(a);
+    if (l == 0) { A[tg] = a; }
+  }
+}
+
+extern "C" __global__ void bend_amq_fin(const u32* X, u32* O, const AMQ* A, CudaQP qp) {
+  const u32* P = qp.v;
+  u32 l = threadIdx.x % 32;
+
+  AMQ a = l < P[1] ? A[l] : AMQ{0xffffffffu, 0, 0xff800000u, 0};
+  a = amq_simd(a);
+  if (l == 0) {
+    u32 bi = P[0] ? a.first : 0, bv = P[0] ? a.bits : 0;
+    if (a.nan) {
+      bi = 0; bv = X[0];
+      for (u32 i = 1; i < P[0]; i += 1) {
+        u32 v = X[i];
+        bool unordered = (v & 0x7fffffffu) > 0x7f800000u
+          || (bv & 0x7fffffffu) > 0x7f800000u;
+        if (!unordered && amq_order_key(v) > amq_order_key(bv)) { bi = i; }
+        if (unordered || amq_order_key(v) >= amq_order_key(bv)) { bv = v; }
+      }
+    }
+    O[0] = bi; O[1] = bv;
+  }
+}
+
+// rmsq's loops as one __shared__ of 512; the sum of squares is a tree.
+extern "C" __global__ void bend_rmsq(u32* X, const u32* Y, const u32* W, u32* O, CudaQP qp) {
+  const u32* P = qp.v;
+  cuda_pad(O, P, 0, P[0]+(P[0]>>6));
+  u32 t = threadIdx.x;
+  u32 sg = threadIdx.x / 32;
+  u32 l = threadIdx.x % 32;
+
+  __shared__ f32 ps[16];
+  u32 n = P[0];
+  f32 s = 0.0f;
+  for (u32 i = t; i < n; i += 512) {
+    f32 v = cuda_float(X[i]);
+    if (P[2]) {
+      v = cuda_float(q4_round(v + cuda_float(Y[i])));
+      X[i] = cuda_bits(v);
+    }
+    s = s + v * v;
+  }
+  s = cuda_sum(s);
+  if (l == 0) {
+    ps[sg] = s;
+  }
+  __syncthreads();
+  s = cuda_sum(l < 16 ? ps[l] : 0.0f);
+  f32 k = 1.0f / sqrtf(s / (f32)n + cuda_float(P[1]));
+  for (u32 g = sg; g < n >> 6; g += 16) {
+    u32 i = g * 64 + l;
+    f32 a = cuda_float(q4_round(cuda_float(W[i]) * (cuda_float(X[i]) * k)));
+    f32 b = cuda_float(q4_round(cuda_float(W[i + 32])
+      * (cuda_float(X[i + 32]) * k)));
+    O[i] = cuda_bits(a);
+    O[i + 32] = cuda_bits(b);
+    f32 sa = cuda_sum(a), sb = cuda_sum(b);
+    if (l == 0) {
+      O[n + g] = cuda_bits(sa + sb);
+    }
+  }
+}
+
+// swq: a SIMD group per 64-value group.
+extern "C" __global__ void bend_swq(const u32* A, u32* O, CudaQP qp) {
+  const u32* P = qp.v;
+  cuda_pad(O, P, 0, P[0]+(P[0]>>6));
+  u32 g = blockIdx.x;
+  u32 l = threadIdx.x % 32;
+
+  u32 n = P[0], i = g * 64 + l;
+  f32 x = cuda_float(A[i]), z = cuda_float(A[i + 32]);
+  f32 a = cuda_float(q4_round(x / (1.0f + expf(-x)) * cuda_float(A[n + i])));
+  f32 b = cuda_float(q4_round(z / (1.0f + expf(-z)) * cuda_float(A[n + i + 32])));
+  O[i] = cuda_bits(a);
+  O[i + 32] = cuda_bits(b);
+  f32 sa = cuda_sum(a), sb = cuda_sum(b);
+  if (l == 0) {
+    O[n + g] = cuda_bits(sa + sb);
+  }
+}
+
+// gdn: a __shared__ of 512 per value head (head h reads key head h); every
+// phase of base.bend's Array.gdn is local to the head. Rows of the delta
+// rule go one to a SIMD group, dk / 32 state values to a lane.
+extern "C" __global__ void bend_gdn(const u32* Y, u32* Wn, u32* S, const u32* CW, const u32* AB, const u32* SN, u32* O, CudaQP qp) {
+  const u32* P = qp.v;
+  cuda_pad(O, P, 0, P[4]+(P[4]>>6));
+  u32 h = blockIdx.x;
+  u32 t = threadIdx.x;
+  u32 sg = threadIdx.x / 32;
+  u32 l = threadIdx.x % 32;
+
+  __shared__ f32 q[256], k[256], v[256], o[256], sc[8];
+  u32 c = P[0], dk = P[1], dv = P[2], nvh = P[3], din = P[4], ko = P[6];
+  f32 eps = cuda_float(P[5]), df = (f32)dk;
+  if (t < 2 * dk + dv) {
+    u32 i = t < dk ? h * dk + t : t < 2 * dk ? ko + h * dk + t - dk
+      : 2 * ko + h * dv + t - 2 * dk;
+    f32 a = cuda_float(Wn[i]), b = cuda_float(Wn[i + c]);
+    f32 cc = cuda_float(Wn[i + 2 * c]), d = cuda_float(Y[i]);
+    f32 acc = a * cuda_float(CW[i * 4]);
+    acc = acc + b * cuda_float(CW[i * 4 + 1]);
+    acc = acc + cc * cuda_float(CW[i * 4 + 2]);
+    f32 x = cuda_float(q4_round(acc + d * cuda_float(CW[i * 4 + 3])));
+    Wn[i] = cuda_bits(b);
+    Wn[i + c] = cuda_bits(cc);
+    Wn[i + 2 * c] = cuda_bits(d);
+    x = cuda_float(q4_round(x * cuda_float(q4_round(1.0f / (1.0f + expf(-x))))));
+    if (t < dk) {
+      q[t] = x;
+    } else if (t < 2 * dk) {
+      k[t - dk] = x;
+    } else {
+      v[t - 2 * dk] = x;
+    }
+  }
+  __syncthreads();
+  if (sg < 2) {
+    f32* a = sg == 0 ? q : k;
+    f32 s = 0.0f;
+    for (u32 i = l; i < dk; i += 32) {
+      s = s + a[i] * a[i];
+    }
+    s = cuda_sum(s);
+    if (l == 0) sc[sg] = 1.0f / sqrtf(s / df + eps / df);
+  } else if (sg == 2 && l == 0) {
+    f32 x = cuda_float(q4_round(cuda_float(Y[c + din + nvh + h])
+      + cuda_float(AB[nvh + h])));
+    f32 sp = cuda_float(q4_round(max(x, 0.0f) + logf(1.0f + expf(-fabsf(x)))));
+    sc[2] = expf(sp * cuda_float(AB[h]));
+    f32 b = cuda_float(Y[c + din + h]);
+    sc[3] = cuda_float(q4_round(1.0f / (1.0f + expf(-b))));
+  }
+  __syncthreads();
+  if (t < dk) {
+    f32 s = cuda_float(q4_round(1.0f / df));
+    q[t] = cuda_float(q4_round(cuda_float(q4_round(q[t] * sc[0])) * s));
+  } else if (t < 2 * dk) {
+    f32 s = cuda_float(q4_round(1.0f / sqrtf(df)));
+    k[t - dk] = cuda_float(q4_round(cuda_float(q4_round(k[t - dk] * sc[1])) * s));
+  }
+  __syncthreads();
+  f32 eg = sc[2], beta = sc[3];
+  for (u32 j = sg; j < dv; j += 16) {
+    u32* R = S + (h * dv + j) * dk;
+    f32 sv[8];
+    f32 d = 0.0f;
+    for (u32 m = 0; m < dk / 32; m += 1) {
+      sv[m] = cuda_float(R[l + 32 * m]);
+      d = d + (sv[m] * eg) * k[l + 32 * m];
+    }
+    d = cuda_sum(d);
+    f32 dj = (v[j] - d) * beta;
+    f32 ov = 0.0f;
+    for (u32 m = 0; m < dk / 32; m += 1) {
+      f32 nv = sv[m] * eg + dj * k[l + 32 * m];
+      R[l + 32 * m] = cuda_bits(nv);
+      ov = ov + nv * q[l + 32 * m];
+    }
+    ov = cuda_sum(ov);
+    if (l == 0) {
+      o[j] = cuda_float(q4_round(ov));
+    }
+  }
+  __syncthreads();
+  if (sg == 0) {
+    f32 s = 0.0f;
+    for (u32 i = l; i < dv; i += 32) {
+      s = s + o[i] * o[i];
+    }
+    s = cuda_sum(s);
+    if (l == 0) sc[4] = 1.0f / sqrtf(s / df + eps);
+  }
+  __syncthreads();
+  if (t < dv) {
+    f32 x = cuda_float(q4_round(cuda_float(SN[t]) * (o[t] * sc[4])));
+    f32 z = cuda_float(Y[c + h * dv + t]);
+    f32 r = cuda_float(q4_round(x * (z / (1.0f + expf(-z)))));
+    O[h * dv + t] = cuda_bits(r);
+    o[t] = r;
+  }
+  __syncthreads();
+  for (u32 g = sg; g < dv >> 6; g += 16) {
+    f32 sa = cuda_sum(o[g * 64 + l]), sb = cuda_sum(o[g * 64 + 32 + l]);
+    if (l == 0) {
+      O[din + ((h * dv) >> 6) + g] = cuda_bits(sa + sb);
+    }
+  }
+}
+
+// atq: a __shared__ of 256 per query head. Each normalizes and rotates its
+// q and its KV head's new k (the group's first head writes k and v to the
+// caches at pos); scores, softmax and the weighted values follow, the
+// current position read from the threadgroup, the older ones from the caches.
+extern "C" __global__ void bend_atq(const u32* Y, u32* KC, u32* VC, const u32* KW, const u32* CS, u32* O, CudaQP qp) {
+  const u32* P = qp.v;
+  cuda_pad(O, P, 0, P[1]*P[3]+((P[1]*P[3])>>6));
+  u32 h = blockIdx.x;
+  u32 t = threadIdx.x;
+  u32 sg = threadIdx.x / 32;
+  u32 l = threadIdx.x % 32;
+
+  __shared__ f32 q[256], k[256], ss[ATQ_MAX], ra[8], rb[8], sc[4];
+  u32 pos = P[0], nq = P[1], nkv = P[2], hd = P[3], hf = P[4];
+  f32 eps = cuda_float(P[5]);
+  u32 g = h / (nq / nkv), ko = nq * hd * 2, st = nkv * hd, vo = ko + st;
+  u32 n = pos + 1;
+  f32 a = 0.0f, b = 0.0f;
+  for (u32 d = t; d < hd; d += 256) {
+    q[d] = cuda_float(Y[h * hd * 2 + d]);
+    k[d] = cuda_float(Y[ko + g * hd + d]);
+    a = a + q[d] * q[d];
+    b = b + k[d] * k[d];
+  }
+  a = cuda_sum(a);
+  b = cuda_sum(b);
+  if (l == 0) {
+    ra[sg] = a;
+    rb[sg] = b;
+  }
+  __syncthreads();
+  if (t == 0) {
+    f32 x = 0.0f, z = 0.0f;
+    for (u32 i = 0; i < 8; i += 1) {
+      x = x + ra[i];
+      z = z + rb[i];
+    }
+    sc[0] = 1.0f / sqrtf(x / (f32)hd + eps);
+    sc[1] = 1.0f / sqrtf(z / (f32)hd + eps);
+  }
+  __syncthreads();
+  for (u32 d = t; d < hd; d += 256) {
+    q[d] = cuda_float(q4_round(cuda_float(KW[d]) * (q[d] * sc[0])));
+    k[d] = cuda_float(q4_round(cuda_float(KW[hd + d]) * (k[d] * sc[1])));
+  }
+  __syncthreads();
+  if (t < hf) {
+    f32 c = cuda_float(CS[t]), s = cuda_float(CS[hf + t]);
+    f32 x = q[t], y = q[t + hf], u = k[t], v = k[t + hf];
+    q[t] = cuda_float(q4_round(x * c - y * s));
+    q[t + hf] = cuda_float(q4_round(y * c + x * s));
+    k[t] = cuda_float(q4_round(u * c - v * s));
+    k[t + hf] = cuda_float(q4_round(v * c + u * s));
+  }
+  __syncthreads();
+  if (h % (nq / nkv) == 0) {
+    for (u32 d = t; d < hd; d += 256) {
+      KC[pos * st + g * hd + d] = cuda_bits(k[d]);
+      VC[pos * st + g * hd + d] = Y[vo + g * hd + d];
+    }
+  }
+  f32 rs = 1.0f / sqrtf((f32)hd);
+  for (u32 p = sg; p < n; p += 8) {
+    f32 dot = 0.0f;
+    for (u32 d = l; d < hd; d += 32) {
+      f32 kv = p == pos ? k[d] : cuda_float(KC[(p * nkv + g) * hd + d]);
+      dot = dot + kv * q[d];
+    }
+    dot = cuda_sum(dot);
+    if (l == 0) {
+      ss[p] = dot * rs;
+    }
+  }
+  __syncthreads();
+  f32 m = -cuda_float(0x7f800000u);
+  for (u32 p = t; p < n; p += 256) {
+    m = max(m, ss[p]);
+  }
+  m = cuda_max(m);
+  if (l == 0) {
+    ra[sg] = m;
+  }
+  __syncthreads();
+  m = ra[0];
+  for (u32 i = 1; i < 8; i += 1) {
+    m = max(m, ra[i]);
+  }
+  f32 s = 0.0f;
+  for (u32 p = t; p < n; p += 256) {
+    f32 e = expf(ss[p] - m);
+    ss[p] = e;
+    s = s + e;
+  }
+  s = cuda_sum(s);
+  if (l == 0) {
+    rb[sg] = s;
+  }
+  __syncthreads();
+  s = 0.0f;
+  for (u32 i = 0; i < 8; i += 1) {
+    s = s + rb[i];
+  }
+  f32 inv = 1.0f / s;
+  for (u32 d = t; d < hd; d += 256) {
+    f32 acc = 0.0f;
+    for (u32 p = 0; p < n; p += 1) {
+      u32 vb = p == pos ? Y[vo + g * hd + d] : VC[(p * nkv + g) * hd + d];
+      acc = acc + cuda_float(vb) * ss[p];
+    }
+    f32 gt = cuda_float(Y[h * hd * 2 + hd + d]);
+    f32 r = cuda_float(q4_round(cuda_float(q4_round(acc * inv))
+      * cuda_float(q4_round(1.0f / (1.0f + expf(-gt))))));
+    O[h * hd + d] = cuda_bits(r);
+    q[d] = r;
+  }
+  __syncthreads();
+  for (u32 gg = sg; gg < hd >> 6; gg += 8) {
+    f32 sa = cuda_sum(q[gg * 64 + l]), sb = cuda_sum(q[gg * 64 + 32 + l]);
+    if (l == 0) {
+      O[nq * hd + ((h * hd) >> 6) + gg] = cuda_bits(sa + sb);
+    }
+  }
+}
 #endif
 
 #ifdef __METAL_VERSION__
@@ -6259,6 +6938,7 @@ static const char* gpu_probe(void) {
   int units = l2 >> 16;
   CUBE_LOG  = 31 - CLZ(units < 16 ? 16 : units > 128 ? 128 : units);
   GPU_CHECK(cuDevicePrimaryCtxRetain, &ctx, gpu_dev);
+  gpu_ctx = ctx;
   result = cuCtxSetCurrent(ctx);
   if (result != CUDA_SUCCESS) {
     cuDevicePrimaryCtxRelease(gpu_dev);
@@ -6288,6 +6968,11 @@ static u64* gpu_map(u64 bytes) {
 #else
   cuMemAdvise(p, bytes, CU_MEM_ADVISE_SET_PREFERRED_LOCATION, gpu_dev);
 #endif
+  if (Q4_GPU && getenv("BEND_Q4_HOST_LINKS")) {
+    gpu_host_links_n = (bytes + 2047) >> 11;
+    gpu_host_links = (u64*)calloc(gpu_host_links_n, sizeof(u64));
+    if (!gpu_host_links) err_fail("CUDA host heap links allocation failed");
+  }
   return (u64*)(uintptr_t)p;
 }
 
@@ -6360,6 +7045,337 @@ static void gpu_load(u64 bytes) {
   }
 }
 
+
+// The inference queue uses its own ordered stream. Kernel parameters are
+// passed by value; no launch retains a pointer to a caller's stack.
+typedef struct { u32 v[10]; } CudaQP;
+static void gpu_cu(CUresult result, const char* what) {
+  if (result == CUDA_SUCCESS) return;
+  const char* name = NULL;
+  cuGetErrorName(result, &name);
+  char msg[192];
+  snprintf(msg, sizeof msg, "%s: %s", what, name ? name : "CUDA error");
+  err_fail(msg);
+}
+static void gpu_qinit(void) {
+  gpu_cu(cuCtxSetCurrent(gpu_ctx), "CUDA context");
+  if (gpu_qstream) return;
+  gpu_cu(cuStreamCreate(&gpu_qstream, CU_STREAM_NON_BLOCKING), "CUDA queue");
+  gpu_cu(cuModuleGetFunction(&gpu_q4pso, gpu_lib, "bend_q4mv"), "CUDA q4mv");
+  gpu_cu(cuModuleGetFunction(&gpu_rbpso, gpu_lib, "bend_roq_table"), "CUDA RoPE table");
+  gpu_cu(cuModuleGetFunction(&gpu_rcpso, gpu_lib, "bend_roq_cached"), "CUDA RoPE cached");
+  gpu_cu(cuModuleGetFunction(&gpu_pkpso, gpu_lib, "bend_q4pack"), "CUDA q4 pack");
+  gpu_cu(cuModuleGetFunction(&gpu_t4pso, gpu_lib, "bend_q4mv_t8"), "CUDA q4 packed matrix");
+  gpu_cu(cuModuleGetFunction(&gpu_ropso, gpu_lib, "bend_roq"), "CUDA RoPE");
+  gpu_cu(cuModuleGetFunction(&gpu_empso, gpu_lib, "bend_q4emb"), "CUDA embedding");
+  gpu_cu(cuModuleGetFunction(&gpu_rmpso, gpu_lib, "bend_rmsq"), "CUDA rmsq");
+  gpu_cu(cuModuleGetFunction(&gpu_swpso, gpu_lib, "bend_swq"), "CUDA swq");
+  gpu_cu(cuModuleGetFunction(&gpu_gdpso, gpu_lib, "bend_gdn"), "CUDA gdn");
+  gpu_cu(cuModuleGetFunction(&gpu_atpso, gpu_lib, "bend_atq"), "CUDA atq");
+  gpu_cu(cuModuleGetFunction(&gpu_ampso, gpu_lib, "bend_amq"), "CUDA amq");
+  gpu_cu(cuModuleGetFunction(&gpu_amfpso, gpu_lib, "bend_amq_fin"), "CUDA amq finish");
+  gpu_cu(cuMemAlloc(&gpu_amscratch, 32 * 16), "CUDA argmax scratch");
+}
+static struct RCache { u32 half, base; CUdeviceptr data; } gpu_rcaches[32];
+static CUdeviceptr gpu_rcache(u32 half, u32 base) {
+  for (u32 i=0;i<32;i+=1) {
+    struct RCache* entry=gpu_rcaches+i;
+    if (entry->data && entry->half==half && entry->base==base) return entry->data;
+    if (entry->data) continue;
+    gpu_cu(cuMemAlloc(&entry->data,(u64)half*2*2048*4),"CUDA RoPE table allocation");
+    CudaQP qp={{0,half,0,base}};
+    void* args[]={&entry->data,&qp};
+    gpu_cu(cuLaunchKernel(gpu_rbpso,(half*2048+127)/128,1,1,128,1,1,0,gpu_qstream,args,NULL),"CUDA RoPE table build");
+    entry->half=half; entry->base=base;
+    return entry->data;
+  }
+  return 0;
+}
+
+// Opt-in cache for immutable q4 model weights kept for the server lifetime.
+// Array data outside that contract must use the ordinary matrix kernel.
+static struct QPack { u64 loc; u32 rows, cols; CUdeviceptr data; } gpu_qpacks[1024];
+static CUdeviceptr gpu_qpack(u64 loc, u32 wm, u32 cols, u32 rows) {
+  u32 h=(u32)(((loc>>8)*0x9e3779b97f4a7c15ull) ^ ((u64)cols*1315423911u) ^ rows)&1023;
+  for (u32 probe=0;probe<1024;probe+=1,h=(h+1)&1023) {
+    struct QPack* entry=gpu_qpacks+h;
+    if (entry->data && entry->loc==loc && entry->rows==rows && entry->cols==cols) return entry->data;
+    if (entry->data) continue;
+    u64 words=(u64)rows*((cols>>3)+2*(cols>>7));
+    gpu_cu(cuMemAlloc(&entry->data,words*4),"CUDA packed weight allocation");
+    CUdeviceptr source=(CUdeviceptr)(uintptr_t)(CORPUS+loc);
+    gpu_cu(cuMemcpyDtoDAsync(entry->data,source,words*4,gpu_qstream),"CUDA packed metadata copy");
+    CudaQP qp={{wm,0,0,cols,rows}};
+    void* args[]={&source,&entry->data,&qp};
+    gpu_cu(cuLaunchKernel(gpu_pkpso,(u32)(((u64)rows*(cols>>3)+255)/256),1,1,
+      256,1,1,0,gpu_qstream,args,NULL),"CUDA packed nibble transpose");
+    entry->loc=loc; entry->rows=rows; entry->cols=cols;
+    if (getenv("BEND_Q4_TRACE")) fprintf(stderr,"cuda immutable q4 packed rows=%u cols=%u bytes=%llu\n",rows,cols,(unsigned long long)(words*4));
+    return entry->data;
+  }
+  err_fail("CUDA immutable weight cache is full");
+  return 0;
+}
+
+// Opt-in device copies of read-only model constants: no arithmetic conversion.
+// These arrays must remain immutable at stable allocations for this process.
+static struct QConst { u64 loc, words; CUdeviceptr data; } gpu_qconsts[1024];
+static CUdeviceptr gpu_qconst(u64 loc, u64 words) {
+  u32 h=(u32)(((loc>>4)*0x9e3779b97f4a7c15ull)^words)&1023;
+  for (u32 probe=0;probe<1024;probe+=1,h=(h+1)&1023) {
+    struct QConst* entry=gpu_qconsts+h;
+    if (entry->data && entry->loc==loc && entry->words==words) return entry->data;
+    if (entry->data) continue;
+    gpu_cu(cuMemAlloc(&entry->data,words*4),"CUDA immutable constant allocation");
+    gpu_cu(cuMemcpyDtoDAsync(entry->data,(CUdeviceptr)(uintptr_t)(CORPUS+loc),
+      words*4,gpu_qstream),"CUDA immutable constant copy");
+    entry->loc=loc; entry->words=words;
+    return entry->data;
+  }
+  err_fail("CUDA immutable constant cache is full");
+  return 0;
+}
+
+// Zero initialization is pending until a GPU reader or q4wait needs it;
+// an output writer instead clears its untouched padding in the same kernel.
+static struct { u64 loc, words; } gpu_qpending[1024];
+static u32 gpu_qpn, gpu_qfused;
+static u64 gpu_qtake(u64 loc) {
+  for (u32 i=0;i<gpu_qpn;i+=1) if (gpu_qpending[i].loc==loc) {
+    u64 words=gpu_qpending[i].words;
+    gpu_qpending[i]=gpu_qpending[--gpu_qpn];
+    return words;
+  }
+  return 0;
+}
+static void gpu_qfill(u64 loc, u64 words) {
+  if (!words) return;
+  gpu_cu(cuMemsetD32Async((CUdeviceptr)(uintptr_t)(CORPUS+loc),0,words,gpu_qstream),
+    "CUDA queued zero fill");
+  gpu_qzeros+=1;
+}
+static void gpu_qflush(void) {
+  while (gpu_qpn) {
+    u32 i=--gpu_qpn;
+    gpu_qfill(gpu_qpending[i].loc,gpu_qpending[i].words);
+  }
+}
+// Optional per-token CUDA graph. Kernel arguments are copied while Bend
+// builds the owned activation chain, then updated before one graph launch.
+// Profiling keeps direct launches so its event order remains unchanged.
+static CUgraph gpu_qgraph;
+static CUgraphExec gpu_qexec;
+static CUgraphNode gpu_qnodes[1024];
+static CUfunction gpu_qfuncs[1024];
+static u32 gpu_qops_n, gpu_qnodes_n;
+static struct QOp {
+  CUfunction fn;
+  u32 groups, threads, nb;
+  CUdeviceptr ptrs[8];
+  CudaQP qp;
+} gpu_qops[1024];
+static void gpu_qsubmit(CUfunction fn, u32 groups, u32 threads, void** args, u32 nb) {
+  if (getenv("BEND_Q4_GRAPH") && !getenv("BEND_Q4_PROFILE")) {
+    if (gpu_qops_n==1024) err_fail("CUDA token graph is too large");
+    struct QOp* op=gpu_qops+gpu_qops_n++;
+    op->fn=fn; op->groups=groups; op->threads=threads; op->nb=nb;
+    for (u32 i=0;i<nb;i+=1) op->ptrs[i]=*(CUdeviceptr*)args[i];
+    op->qp=*(CudaQP*)args[nb];
+    return;
+  }
+  gpu_cu(cuLaunchKernel(fn,groups,1,1,threads,1,1,0,gpu_qstream,args,NULL),
+    "CUDA inference launch");
+}
+static void gpu_qgraph_run(void) {
+  if (!gpu_qops_n) return;
+  bool same=gpu_qexec && gpu_qnodes_n==gpu_qops_n;
+  for (u32 i=0;same && i<gpu_qops_n;i+=1) same=gpu_qfuncs[i]==gpu_qops[i].fn;
+  if (!same) {
+    if (gpu_qexec) gpu_cu(cuGraphExecDestroy(gpu_qexec),"CUDA graph release");
+    if (gpu_qgraph) gpu_cu(cuGraphDestroy(gpu_qgraph),"CUDA graph release");
+    gpu_qexec=NULL; gpu_qgraph=NULL;
+    gpu_cu(cuGraphCreate(&gpu_qgraph,0),"CUDA graph create");
+  }
+  for (u32 i=0;i<gpu_qops_n;i+=1) {
+    struct QOp* op=gpu_qops+i;
+    void* args[9];
+    for (u32 j=0;j<op->nb;j+=1) args[j]=op->ptrs+j;
+    args[op->nb]=&op->qp;
+    CUDA_KERNEL_NODE_PARAMS params={0};
+    params.func=op->fn;
+    params.gridDimX=op->groups; params.gridDimY=1; params.gridDimZ=1;
+    params.blockDimX=op->threads; params.blockDimY=1; params.blockDimZ=1;
+    params.kernelParams=args;
+    if (same) {
+      gpu_cu(cuGraphExecKernelNodeSetParams(gpu_qexec,gpu_qnodes[i],&params),
+        "CUDA graph kernel update");
+    } else {
+      gpu_cu(cuGraphAddKernelNode(gpu_qnodes+i,gpu_qgraph,
+        i?gpu_qnodes+i-1:NULL,i?1:0,&params),"CUDA graph kernel add");
+      gpu_qfuncs[i]=op->fn;
+    }
+  }
+  if (!same) {
+    gpu_cu(cuGraphInstantiateWithFlags(&gpu_qexec,gpu_qgraph,0),"CUDA graph instantiate");
+    gpu_qnodes_n=gpu_qops_n;
+  }
+  gpu_cu(cuGraphLaunch(gpu_qexec,gpu_qstream),"CUDA token graph launch");
+  gpu_qops_n=0;
+}
+static void gpu_qbefore(u32 type) {
+  if (!getenv("BEND_Q4_PROFILE") || gpu_qei >= 256) return;
+  if (!gpu_qev[gpu_qei][0]) {
+    gpu_cu(cuEventCreate(&gpu_qev[gpu_qei][0], CU_EVENT_DEFAULT), "CUDA profile event");
+    gpu_cu(cuEventCreate(&gpu_qev[gpu_qei][1], CU_EVENT_DEFAULT), "CUDA profile event");
+  }
+  gpu_qtype[gpu_qei] = type;
+  gpu_cu(cuEventRecord(gpu_qev[gpu_qei][0], gpu_qstream), "CUDA profile start");
+}
+static void gpu_qafter(void) {
+  if (!getenv("BEND_Q4_PROFILE") || gpu_qei >= 256) return;
+  gpu_cu(cuEventRecord(gpu_qev[gpu_qei][1], gpu_qstream), "CUDA profile end");
+  gpu_qei += 1;
+}
+static void gpu_qlaunch(CUfunction fn, const u64* at, u32 nb, const u32* p,
+  u32 np, u32 groups, u32 threads) {
+  CUdeviceptr ptrs[8];
+  void* args[9];
+  CudaQP qp = {{0}};
+  for (u32 i = 0; i < nb; i += 1) {
+    ptrs[i] = (CUdeviceptr)(uintptr_t)(CORPUS + at[i]);
+    args[i] = ptrs + i;
+  }
+  memcpy(qp.v, p, np * sizeof(u32));
+  if (fn==gpu_t4pso) ptrs[0]=gpu_qpack(at[0],p[0],p[3],p[4]);
+  if (fn==gpu_empso && getenv("BEND_Q4_IMMUTABLE_PACK")) {
+    ptrs[0]=gpu_qpack(at[0],p[0],p[3],p[4]); qp.v[7]=1;
+  }
+  if (getenv("BEND_Q4_IMMUTABLE_CONST")) {
+    if (fn==gpu_rmpso) ptrs[2]=gpu_qconst(at[2],p[0]);
+    if (fn==gpu_gdpso) {
+      ptrs[3]=gpu_qconst(at[3],(u64)p[0]*4);
+      ptrs[4]=gpu_qconst(at[4],(u64)p[3]*2);
+      ptrs[5]=gpu_qconst(at[5],p[2]);
+    }
+    if (fn==gpu_atpso) ptrs[3]=gpu_qconst(at[3],(u64)p[3]*2);
+  }
+  if (fn==gpu_rcpso) ptrs[1]=gpu_rcache(p[1],p[3]);
+  u32 oi=(fn==gpu_ropso || fn==gpu_rcpso)?0:fn==gpu_empso?1:(fn==gpu_q4pso || fn==gpu_t4pso)?2:fn==gpu_rmpso?3:fn==gpu_swpso?1:fn==gpu_gdpso?6:5;
+  for (u32 i=0;i<nb;i+=1) if (i!=oi && !(fn==gpu_rcpso && i==1)) gpu_qfill(at[i],gpu_qtake(at[i]));
+  u64 words=gpu_qtake(at[oi]);
+  if (!groups) { gpu_qfill(at[oi],words); return; }
+  if (words) { qp.v[8]=1; qp.v[9]=(u32)words; gpu_qfused+=1; }
+  args[nb] = &qp;
+  gpu_qbefore((fn == gpu_q4pso || fn == gpu_t4pso) ? 0 : fn == gpu_rmpso ? 1 : fn == gpu_swpso ? 2 : fn == gpu_gdpso ? 3 : fn == gpu_empso ? 6 : (fn == gpu_ropso || fn == gpu_rcpso) ? 7 : 4);
+  gpu_qsubmit(fn,groups,threads,args,nb);
+  gpu_qafter();
+  gpu_qk += 1;
+}
+static void gpu_q4wait(void) {
+  if (!io_gpu || !gpu_qstream) return;
+  pthread_mutex_lock(&gpu_qlock);
+  gpu_cu(cuCtxSetCurrent(gpu_ctx), "CUDA context");
+  gpu_qgraph_run();
+  gpu_qflush();
+  gpu_cu(cuStreamSynchronize(gpu_qstream), "CUDA inference wait");
+  if (getenv("BEND_Q4_TRACE") && (gpu_qk || gpu_qzeros))
+    fprintf(stderr, "cuda q4 wait kernels=%u zero_fills=%u fused_zero_fills=%u\n", gpu_qk, gpu_qzeros, gpu_qfused);
+  if (getenv("BEND_Q4_PROFILE") && gpu_qei) {
+    double ms[8]={0};
+    for (u32 i=0;i<gpu_qei;i+=1) {
+      float elapsed=0;
+      gpu_cu(cuEventElapsedTime(&elapsed,gpu_qev[i][0],gpu_qev[i][1]), "CUDA profile elapsed");
+      ms[gpu_qtype[i]] += elapsed;
+    }
+    fprintf(stderr,"cuda profile ms q4=%.3f rms=%.3f sw=%.3f gdn=%.3f at=%.3f am=%.3f emb=%.3f rope=%.3f\n", ms[0],ms[1],ms[2],ms[3],ms[4],ms[5],ms[6],ms[7]);
+    gpu_qei=0;
+  }
+  gpu_qk = 0;
+  gpu_qzeros = 0;
+  gpu_qfused = 0;
+  pthread_mutex_unlock(&gpu_qlock);
+}
+static bool gpu_qkern(CUfunction* fn, const u64* at, u32 nb, const u32* p,
+  u32 np, u32 groups, u32 threads) {
+  if (!io_gpu || !gpu_lib) return false;
+  pthread_mutex_lock(&gpu_qlock);
+  gpu_qinit();
+  gpu_qlaunch(*fn, at, nb, p, np, groups, threads);
+  pthread_mutex_unlock(&gpu_qlock);
+  return true;
+}
+static void gpu_qzero(u64 loc, u64 words) {
+  pthread_mutex_lock(&gpu_qlock);
+  gpu_qinit();
+  if (gpu_qpn==1024) gpu_qflush();
+  gpu_qpending[gpu_qpn].loc=loc;
+  gpu_qpending[gpu_qpn++].words=words;
+  pthread_mutex_unlock(&gpu_qlock);
+}
+static bool gpu_roq(u64 o,u32 om,u32 half,u32 pos,u32 base) {
+  if (!io_gpu || !gpu_lib) return false;
+  if (half && pos<2048) {
+    // The second argument belongs to the pure device cache, not CORPUS.
+    pthread_mutex_lock(&gpu_qlock);
+    gpu_qinit();
+    CUdeviceptr table=gpu_rcache(half,base);
+    if (table) {
+      u64 at[2]={o,0}; u32 p[4]={om,half,pos,base};
+      gpu_qlaunch(gpu_rcpso,at,2,p,4,(half+127)/128,128);
+      pthread_mutex_unlock(&gpu_qlock);
+      return true;
+    }
+    pthread_mutex_unlock(&gpu_qlock);
+  }
+  u64 at[1]={o}; u32 p[4]={om,half,pos,base};
+  return gpu_qkern(&gpu_ropso,at,1,p,4,(half+127)/128,128);
+}
+static bool gpu_qemb(u64 w,u64 o,u32 wm,u32 om,u32 r,u32 c,u32 rows) {
+  u64 at[2]={w,o}; u32 p[8]={wm,om,r,c,rows,0,0,0};
+  return gpu_qkern(&gpu_empso,at,2,p,8,(c+255)/256,256);
+}
+static bool gpu_rmsq(u64 x,u64 y,u64 w,u64 o,u32 n,u32 eps,u32 add) {
+  u64 at[4]={x,y,w,o}; u32 p[4]={n,eps,add,0};
+  return gpu_qkern(&gpu_rmpso,at,4,p,4,1,512);
+}
+static bool gpu_swq(u64 a,u64 o,u32 n) {
+  u64 at[2]={a,o}; u32 p[4]={n,0,0,0};
+  return gpu_qkern(&gpu_swpso,at,2,p,4,n>>6,32);
+}
+static bool gpu_gdn(const u64* at,const u32* p) {
+  return gpu_qkern(&gpu_gdpso,at,7,p,8,p[3],512);
+}
+static bool gpu_atq(const u64* at,const u32* p) {
+  return gpu_qkern(&gpu_atpso,at,6,p,8,p[1],256);
+}
+static bool gpu_q4mv(u64 w,u64 x,u64 y,u32 wm,u32 xm,u32 ym,u32 r,
+  u32 n,u32 c,u32 rows,bool queued) {
+  u64 at[3]={w,x,y}; u32 p[8]={wm,xm,ym,c,rows,0,r,n};
+  if (n == 0) { if (!queued) gpu_q4wait(); return io_gpu; }
+  bool ok = gpu_qkern(getenv("BEND_Q4_IMMUTABLE_PACK")?&gpu_t4pso:&gpu_q4pso,at,3,p,8,(n+3)/4,128);
+  if (ok && !queued) gpu_q4wait();
+  return ok;
+}
+static bool gpu_amq(u64 x,u64 o,u32 n) {
+  if (!io_gpu || !gpu_lib) return false;
+  pthread_mutex_lock(&gpu_qlock);
+  gpu_qinit();
+  gpu_qfill(x,gpu_qtake(x));
+  CudaQP qp={{n,(u32)(((u64)n+1023)/1024)}};
+  qp.v[1]=qp.v[1]<1?1:qp.v[1]>32?32:qp.v[1];
+  CUdeviceptr xp=(CUdeviceptr)(uintptr_t)(CORPUS+x);
+  CUdeviceptr op=(CUdeviceptr)(uintptr_t)(CORPUS+o);
+  void* a[]={&xp,&gpu_amscratch,&qp};
+  gpu_qbefore(5);
+  gpu_qsubmit(gpu_ampso,qp.v[1],256,a,2);
+  void* b[]={&xp,&op,&gpu_amscratch,&qp};
+  gpu_qsubmit(gpu_amfpso,1,32,b,3);
+  gpu_qafter();
+  gpu_qk+=2;
+  pthread_mutex_unlock(&gpu_qlock);
+  return true;
+}
+
 static void gpu_kernel(u32 pass, u32 groups) {
   void* args[] = { &CORPUS, &pass };
   if (cuLaunchKernel(gpu_pso, groups, 1, 1, CUBE_T, 1, 1, TG_HOLD * 8, NULL,
@@ -6369,6 +7385,9 @@ static void gpu_kernel(u32 pass, u32 groups) {
 }
 
 static void gpu_pass(u32 f) {
+  gpu_q4wait();
+  if (gpu_host_links) err_fail("BEND_Q4_HOST_LINKS supports inference kernels only");
+  gpu_cu(cuCtxSetCurrent(gpu_ctx), "CUDA context");
   gpu_run(f);
   if (cuCtxSynchronize() != CUDA_SUCCESS) {
     err_fail("device fault");
@@ -7241,8 +8260,8 @@ int main(int argc, char** argv) {
       io_argv[io_argc++] = argv[i];
     }
   }
-  const char* why = gpu != 0 && BANGS != 0 ? gpu_probe() : "";
-  if (gpu == 1 && BANGS != 0 && why != NULL) {
+  const char* why = gpu != 0 && (BANGS != 0 || Q4_GPU != 0) ? gpu_probe() : "";
+  if (gpu == 1 && (BANGS != 0 || Q4_GPU != 0) && why != NULL) {
     err_fail(why);
   }
   bool dev = why == NULL;

@@ -432,7 +432,8 @@ function cli_build(bin: string, file: string): void {
   const cuda  = [process.env.CUDA_HOME, process.env.CUDA_PATH,
     "/usr/local/cuda", "/opt/cuda"]
     .find(d => d && fs.existsSync(d + "/include/nvrtc.h")) ?? "";
-  const bangs = !/^#define BANGS\s+0$/m.test(c) && (mac || cuda !== "");
+  const bangs = (!/^#define BANGS\s+0$/m.test(c)
+    || /^#define Q4_GPU\s+1$/m.test(c)) && (mac || cuda !== "");
   const cc    = cc_find(bangs);
   const objc  = mac && (bangs || /^#import /m.test(c))
     ? ["-x", "objective-c", "-fobjc-arc", "-fmodules"] : [];
