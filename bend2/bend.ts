@@ -314,7 +314,7 @@ export type Env = List<HTerm | ((s?: Span) => HTerm)>;
 export type Ctr  = { k: Name; n: number; T: HTerm }
 export type Ctrs = Array<Ctr>;
 export type ADT  = { $: "ADT"; n: number; g: number; T: HTerm; c: Ctrs; b?: Bool; };
-export type Def  = { $: "Def"; n: number; x: number; T: HTerm; v: HTerm | null; e?: LTerm; b?: Bool; u?: Bool; i?: string[]; m?: string; };
+export type Def  = { $: "Def"; n: number; x: number; T: HTerm; v: HTerm | null; e?: LTerm; b?: Bool; u?: Bool; i?: string[]; m?: string; l?: Bool; };
 export type TLD  = ADT | Def;
 export type Book = { tlds: Record<Name, TLD>; ctrs: Record<Name, Ctr>; order: Name[]; hols: number; tmps: Record<Name, Map<string, Name>>; };
 
@@ -901,10 +901,10 @@ export const BEND_HUB   = process.env.BEND_HUB ?? "https://hub.bend-lang.com";
 export const NAMED = /^([a-z][a-z0-9-]{0,63})@((?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){3})$/;
 
 async function hub_get(book: Book, sub: string, hash: string, spn?: Span): Promise<string> {
-  const res = await fetch(BEND_HUB + "/" + sub);
-  const src = res.ok ? await res.text() : "";
+  const res = await fetch(BEND_HUB + "/" + sub, { signal: AbortSignal.timeout(30000) }).catch(() => null);
+  const src = res?.ok ? await res.text().catch(() => "") : "";
   const sum = Buffer.from(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(src))).toString("hex");
-  if (!res.ok || hash.length < 32 || sum.slice(0, hash.length) !== hash || path.posix.normalize("/" + sub) !== "/" + sub) {
+  if (!res?.ok || hash.length < 32 || sum.slice(0, hash.length) !== hash || path.posix.normalize("/" + sub) !== "/" + sub) {
     throw Err(book, ctx_nil(), "a file at " + BEND_HUB + "/" + sub + " hashing to " + hash, undefined, spn);
   }
   return src;
@@ -919,8 +919,8 @@ async function name_hash(book: Book, nv: string, spn?: Span): Promise<string> {
   if (/^0x[0-9a-f]{32}$/.test(old)) {
     return old;
   }
-  const res = await fetch(BEND_HUB + "/name/" + nv).catch(() => null);
-  const got = res?.ok ? (await res.text()).trim() : "";
+  const res = await fetch(BEND_HUB + "/name/" + nv, { signal: AbortSignal.timeout(30000) }).catch(() => null);
+  const got = res?.ok ? (await res.text().catch(() => "")).trim() : "";
   if (!/^0x[0-9a-f]{32}$/.test(got)) {
     throw Err(book, ctx_nil(), "a package named " + nv + " on " + BEND_HUB
       + (res?.status === 410 ? " (it was taken down)" : ""), undefined, spn);
@@ -2578,7 +2578,7 @@ export function parse_book(book: Book, dir: string, src: string, ns: string, al:
       const T = cls.reduceRight((T, [all, q, c, i, A, s]) =>
         all ? All(q, c, i, A, T, s) : App(App(Ref("Exists", s), A, s), Lam(c, i, T, s), s), parse_block(p));
       const n = cls.findIndex((c) => !c[0]);
-      book.tlds[k] = { $: "Def", n: n < 0 ? cls.length : n, T: term_higher(T), v: null, x: tc, m: p.ns };
+      book.tlds[k] = { $: "Def", n: n < 0 ? cls.length : n, T: term_higher(T), v: null, x: tc, m: p.ns, l: true };
       book.order.push(k);
       continue;
     }

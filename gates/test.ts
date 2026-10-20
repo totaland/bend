@@ -10,11 +10,15 @@
 // run, its JS run and its C run all print its `#|` lines; a test whose main
 // the compiler refuses to print (a function, a Type, an erased or dependent
 // field) is checked and interpreted only; a foreign def with no twin for a
-// lane drops that lane; any other build failure fails its lanes.
+// lane drops that lane; any other build failure fails its lanes. Meanwhile,
+// here, one process compares the comptime twins' C, then compiles four
+// state fixtures over and over (state_run).
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import * as Bend from "../bend2/bend.ts";
+import * as Comp from "../bend2/comp.ts";
 import * as lib from "./_lib";
 
 // Types
@@ -55,7 +59,7 @@ function test_read(dir: string, file: string): Test {
     .map((m) => m[1]);
   // A program compiles only over Base (its IO runs main): a test without
   // it checks and interprets alone.
-  const lanes = ["js", "c"].filter((l) => /^import Base$/m.test(src)
+  const lanes = ["js", "c"].filter((l) => /^(?:[\t\r ]*(?:(?:#|import[\t ])[^\n]*)?\n)*[\t ]*import[\t ]+Base(?=[\t\r ]*(?:#|\n|$))/.test(src)
     && (effs.length === 0 || effs.includes(l)));
   return { name: dir + "_" + path.basename(file, ".bend"), src,
     want: tidy(want), main: /^(def|law) main(\(|:)/m.test(src), lanes };
@@ -135,7 +139,7 @@ function shard_script(shard: Test[], tag: number): string {
   const probe = (kind: string, cmd: string): string =>
     `echo "${MARK} ${kind} $m"; perl -e 'alarm 5; exec @ARGV' ${cmd} 2>&1;`
     + ` echo "${MARK} exit $?";`;
-  return `export BUN_JSC_maxPerThreadStackUsage=33554432;`
+  return `export BUN_JSC_maxPerThreadStackUsage=33554432; unset BENDRTS;`
     + ` d=$HOME/bend-test/${tag}; rm -rf $d; mkdir -p $d; cd $d; tar -xzf -;`
     + ` ${tmp}\n`
     + file("main.bend", main) + file("build.txt", build)
@@ -195,6 +199,100 @@ async function shard_run(shard: Test[], pack: Buffer, tag: number,
   }
 }
 
+// State
+// =====
+
+// The comptime twins promise the same C up to FID names. Keep every other
+// byte, naming each FID by its numeric declaration. Only tmpl may declare
+// a List.map instance: without it, the twins match without the template.
+async function comptime_run(): Promise<Fail[]> {
+  const fail = (probe: string, want: string, got: string): Fail[] =>
+    [{ name: "comptime_tmpl", probe, want, got }];
+  const emit = async (file: string): Promise<string> => {
+    const book = Bend.book_nil();
+    await Bend.book_load(book, path.join(TESTS, "comptime", file + ".bend"),
+      "", new Map());
+    Bend.book_valid(book);
+    return Comp.compile_book(book);
+  };
+  // main awaits this only after the shards, so a twin that fails to check
+  // must fail here, not reject (its shard fails it too)
+  let c: string[];
+  try {
+    c = [await emit("hand"), await emit("tmpl")];
+  } catch {
+    return fail("C matches hand", "both twins compile", "a twin fails");
+  }
+  const maps = c.map((s) => /^#define FID_List_map\w* /m.test(s));
+  if (maps[0] || !maps[1]) {
+    return fail("only tmpl declares List.map", "false true",
+      maps.join(" "));
+  }
+  const [hand, tmpl] = c.map((s) => {
+    const ids = new Map([...s.matchAll(/^#define (FID_\w+) (\d+)$/gm)]
+      .map((m) => [m[1], "FID_" + m[2]]));
+    return s.replace(/\bFID_\w+\b/g, (k) => ids.get(k) ?? k).split("\n");
+  });
+  for (let i = 0; i < hand.length || i < tmpl.length; ++i) {
+    if (hand[i] !== tmpl[i]) {
+      return fail("C matches hand at line " + String(i + 1),
+        hand[i] ?? "(end of file)", tmpl[i] ?? "(end of file)");
+    }
+  }
+  return [];
+}
+
+// After comparing the comptime twins, check the four state fixtures.
+// A process may compile many books (the bun loader, io_run), and none may
+// leave state for the next: #976 kept every book's probes, with the same
+// bytes. Each fixture loads and checks twice. Its first copy's C and JS
+// are the baseline (compiled after the earlier fixtures' baselines, not in
+// a fresh process); its second copy must match them, bytes and probes left,
+// at every step: C, C, JS, C, normalization, JS, C, the next fixture (+),
+// C, JS. It builds and runs nothing: the shards run these programs.
+async function state_run(): Promise<Fail[]> {
+  const fails = await comptime_run();
+  const files = ["reg/borrow_loop", "run/harness_cache_compile",
+    "run/harness_cache_purity", "run/harness_cache_stats"];
+  const books: Bend.Book[][] = [];
+  for (const file of files) {
+    const copies = [Bend.book_nil(), Bend.book_nil()];
+    for (const book of copies) {
+      await Bend.book_load(book, path.join(TESTS, file + ".bend"), "",
+        new Map());
+      Bend.book_valid(book);
+    }
+    books.push(copies);
+  }
+  const emit = (book: Bend.Book, lane: string): string =>
+    Bun.hash(lane === "c" ? Comp.compile_book(book) : Comp.js_book(book))
+    + " bytes, " + String(Comp.PROBES.length) + " probes";
+  const base = books.map(([book]): Record<string, string> =>
+    ({ c: emit(book, "c"), js: emit(book, "js") }));
+  for (const [i, file] of files.entries()) {
+    const book = books[i][1];
+    // the steps on this fixture's second copy; + is the next fixture's
+    for (const step of "c c js c snf js c +c +js c js".split(" ")) {
+      if (step === "snf") {
+        for (const def of Object.values(book.tlds)) {
+          if (def.$ === "Def" && def.v !== null) {
+            Bend.term_snf(book, def.v);
+          }
+        }
+        continue;
+      }
+      const at = step[0] === "+" ? (i + 1) % files.length : i;
+      const lane = step[0] === "+" ? step.slice(1) : step;
+      const got = emit(books[at][1], lane);
+      if (got !== base[at][lane]) {
+        fails.push({ name: files[at].replace("/", "_"),
+          probe: "state " + file + " " + step, want: base[at][lane], got });
+      }
+    }
+  }
+  return fails;
+}
+
 // Main
 // ====
 
@@ -202,6 +300,7 @@ if (import.meta.main) {
   const tests = fs.readdirSync(TESTS).sort().flatMap((dir) =>
     fs.readdirSync(path.join(TESTS, dir)).filter((f) => f.endsWith(".bend"))
       .sort().map((f) => test_read(dir, f)));
+  const state = state_run();
   const nodes = await lib.node_lock();
   // Every test's source goes to every shard: a test may import another,
   // or a module from a subdirectory.
@@ -210,6 +309,7 @@ if (import.meta.main) {
   const fails: Fail[] = [];
   await lib.node_pool(nodes, shards.map((shard, tag) => (node: number) =>
     shard_run(shard, pack, tag, node, fails)));
+  fails.push(...await state);
   fails.sort((a, b) => a.name < b.name ? -1 : 1);
   if (!lib.GATE) {
     for (const f of fails) {
