@@ -4224,12 +4224,15 @@ OUTLINE void span_fade(Env e, Term t, u64 src, u32 n) {
 
 INLINE u64 ctr_take(Env e, Term t, u32 n, THR Term* out) {
   DEV u64* H = e.mem;
+  if (!term_rfc(t)) {
+    for (u32 j = 0; j < n; j += 1) {
+      out[j] = H[term_loc(t) + j];
+    }
+    return term_loc(t);
+  }
   u64 src = term_peek(H, t);
   for (u32 j = 0; j < n; j += 1) {
     out[j] = H[src + j];
-  }
-  if (!term_rfc(t)) {
-    return src;
   }
   DEV u32* c = a32_at(H, term_loc(t));
   if ((a32_load(c) & RFC_CNT) == 1) {
