@@ -2855,10 +2855,47 @@ function effect_src(k: Name, tld: Bend.Def & { i: string[] }): void {
 // C
 // -
 
-// A segment may fork if one it reaches does; Clo~apply reaches every
-// closure. The device holds what the bangs reach (every closure, if a bang
-// may take one). rp pads the host's twelfth slot to keep rax free for the
-// tail call. WL_LOAD is a ladder: clang is O(n^2) on a fallthrough switch.
+// A segment may fork if one it reaches does; on the device Clo~apply
+// reaches every closure. On the host it reaches none: an applied closure
+// that forks, entered with nothing stacked over its task's frame, leaves
+// the fork-free mode its caller ran in. Else it runs in sequence, as every
+// closure caller did when one closure in the program forked. The device holds what the bangs reach, and every closure when a
+// bang's parameter may hold one. One bank serves both lanes: rp pads the
+// host's twelfth slot, which keeps rax free for the tail call. WL_LOAD is a
+// ladder, as clang builds the phi cascade of a fallthrough switch in O(n^2).
+
+// A generic jump (FID_ENTER, Clo~apply, FID_EXIT) fills words from memory
+// before a musttail. Through the ladder every word of the bank may be set,
+// so the host passes all of them, on the stack past the argument registers:
+// a 175-word bank made each closure call copy 175 words. Below WL_FANS
+// words, a case per count sets just its words and jumps, leaving the rest
+// undefined; the device's switch keeps the ladder. FID_EXIT saves only the
+// words its return carries.
+const WL_FANS = 16;
+
+function wl_fans(rs: string[], resw: number): string[] {
+  const fan = (k: number, name: string, ps: string, get: (i: number) => string,
+    last: (n: number) => string, jump: string, ladder: string): string => {
+    const cs = [...Array(k).keys()].map((n) =>
+      `    case ${n}: { ${[...Array(n).keys()].map(get).join(" ")} ${last(n)} ${jump} } \\\n`);
+    return `#if DEVICE\n#define ${name}(${ps}) ${ladder}\n#else\n#define ${name}(${ps}) \\\n`
+      + `  switch (FN) { \\\n${cs.join("")}    default: { ${ladder} } \\\n  }\n#endif`;
+  };
+  const mem = (i: number) => `${rs[i]} = e.mem[(A) + ${i}];`;
+  const ks = Math.min(WL_FANS, resw + 1);
+  const save = [...Array(ks).keys()].map((n) => `    case ${n}: ${[...Array(n)
+    .keys()].map((i) => `(V)[${i}] = ${rs[i]};`).join(" ")} break; \\\n`);
+  return [
+    fan(Math.min(WL_FANS, rs.length + 1), "WL_FAN_LOAD", "A, FN, PRE, F", mem, () => "PRE;", "WL_DYN(F);",
+      "WL_LOAD(A, FN) PRE; WL_DYN(F);"), "",
+    fan(Math.min(WL_FANS, rs.length + 1), "WL_FAN_APPLY", "A, FN, X, PRE, F", mem,
+      (n) => n < rs.length ? `${rs[n]} = (X); PRE;` : "PRE;", "WL_DYN(F);",
+      "WL_LOAD(A, FN) PRE; WL_LAST(X) WL_DYN(F);"), "",
+    fan(Math.min(WL_FANS, resw + 1), "WL_FAN_TAKE", "V, FN, JUMP", (i) => `${rs[i]} = (V)[${i}];`, () => "",
+      "JUMP;", "WL_TAKE(V) JUMP;"), "",
+    `#if DEVICE\n#define WL_FAN_SAVE(V, FN) WL_SAVE(V)\n#else\n#define WL_FAN_SAVE(V, FN) \\\n`
+      + `  switch (FN) { \\\n${save.join("")}    default: WL_SAVE(V) break; \\\n  }\n#endif`, ""];
+}
 
 export function compile_book(book: Bend.Book): string {
   FL = file_new(book, false);
@@ -2925,9 +2962,11 @@ export function compile_book(book: Bend.Book): string {
     }
   }
   done_defs(def_foreign).forEach(([k]) => cid(k, fun_of(k).lays.length));
-  const forky = graph_close(new Set(FL.segs.filter((s) => s.fork)
-    .map((s) => s.fid)), [...FL.segs, { fid: seg_fid(CLO_APPLY),
-    refs: FL.clos }].flatMap((s) => [...s.refs].map((r) => [r, s.fid])));
+  const forks = () => new Set(FL.segs.filter((s) => s.fork).map((s) => s.fid));
+  const calls = FL.segs.flatMap((s) => [...s.refs].map((r) => [r, s.fid]));
+  const forky = graph_close(forks(), [...calls,
+    ...[...FL.clos].map((c) => [c, seg_fid(CLO_APPLY)])]);
+  const hosty = graph_close(forks(), calls);
   if (entries.some((s) => s.params.length > WIDE)
     || [...cids.values()].some(([n]) => n > 255)) {
     die("an arity over " + WIDE);
@@ -2943,7 +2982,7 @@ export function compile_book(book: Bend.Book): string {
   const ws = n > 6 ? [...rs.slice(0, 6), "rp", ...rs.slice(6)] : rs;
   defs.push(`CONSTV Fid FID_T[] = { ${entries.map((s) => `{ ${[s.params.length,
     s.frame === null ? 0 : s.params.length - s.frame.at.length,
-    FL.bangs.has(s.def), !forky.has(s.fid)].map(Number).join(", ")} }`)
+    FL.bangs.has(s.def), !forky.has(s.fid), !hosty.has(s.fid)].map(Number).join(", ")} }`)
     .join(", ")} };`,
   `CONSTV Cid CID_T[] = { ${[...cids.values()].map((r) =>
     `{ ${r.join(", ")} }`).join(", ")} };`,
@@ -2959,6 +2998,7 @@ export function compile_book(book: Bend.Book): string {
     `(V)[${j}] = ${r};`).join(" ")}`, "",
   `#define WL_TAKE(V) ${rs.slice(0, resw).map((r, j) =>
     `${r} = (V)[${j}];`).join(" ")}`, "",
+  ...wl_fans(rs, resw),
   `#define WL_SIG Env e, DEV Term* sp, u32 seq, u32 rn, ${ws.map((w) =>
     "Term " + w).join(", ")}`, "", `#define WL_ALL e, sp, seq, rn, ${ws
     .join(", ")}`, "",
@@ -3646,7 +3686,7 @@ static const char* CLI_HELP =
 // Tables
 // ======
 
-typedef struct { u8 ar, resw, bangs, nofk; } Fid;
+typedef struct { u8 ar, resw, bangs, nofk, hnfk; } Fid;
 typedef struct { u8 ar, hot; u16 spine; } Cid;
 
 ${tabs}
@@ -3656,7 +3696,7 @@ ${tabs}
 #define fid_arity(x) FID_T[x].ar
 #define fid_resw(x)  FID_T[x].resw
 #define fid_bangs(x) FID_T[x].bangs
-#define fid_nofk(x)  FID_T[x].nofk
+#define fid_nofk(x)  (DEVICE ? FID_T[x].nofk : FID_T[x].hnfk)
 #define cid_arity(x) CID_T[x].ar
 #define cid_hot(x)   CID_T[x].hot
 
@@ -4502,18 +4542,25 @@ static bool gpu_qemb(u64 w, u64 o, u32 wm, u32 om, u32 r, u32 c, u32 rows);
 #if !DEVICE && BEND_CUDA
 static bool gpu_roq(u64 o, u32 om, u32 half, u32 pos, u32 base);
 #endif
-INLINE Term roq(Env e, Term o, u64 half, u64 pos, u64 base) {
+// Metal names a type half and has no double: there roq (reached by a bang
+// only through its CUDA branch) computes in float.
+#ifdef __METAL_VERSION__
+#define ROQ_D float
+#else
+#define ROQ_D double
+#endif
+INLINE Term roq(Env e, Term o, u64 hn, u64 pos, u64 base) {
   u64 no=1ull<<blk_cls(o);
-  bool fit=half<=256 && half*2<=no && pos<=0xffffffffu;
+  bool fit=hn<=256 && hn*2<=no && pos<=0xffffffffu;
 #if !DEVICE && BEND_CUDA
-  if (fit && gpu_roq(blk_loc(e.mem,o),(u32)(no-1),(u32)half,(u32)pos,(u32)base)) return o;
+  if (fit && gpu_roq(blk_loc(e.mem,o),(u32)(no-1),(u32)hn,(u32)pos,(u32)base)) return o;
   if (io_gpu && getenv("BEND_Q4_REQUIRE_CUDA")) err_fail("roq shape is unsupported on CUDA");
 #endif
   if (!fit) return o;
   DEV u32a* O=blk_ptr(e.mem,blk_loc(e.mem,o),0);
-  for (u32 j=0;j<(u32)half;j+=1) {
-    f32 t=(f32)pos*(f32)pow((double)f32_unbox((u32)base),(double)(-(f32)j/(f32)half));
-    O[j]=(u32)f32_rewrap((f32)cos((double)t)); O[half+j]=(u32)f32_rewrap((f32)sin((double)t));
+  for (u32 j=0;j<(u32)hn;j+=1) {
+    f32 t=(f32)pos*(f32)pow((ROQ_D)f32_unbox((u32)base),(ROQ_D)(-(f32)j/(f32)hn));
+    O[j]=(u32)f32_rewrap((f32)cos((ROQ_D)t)); O[hn+j]=(u32)f32_rewrap((f32)sin((ROQ_D)t));
   }
   return o;
 }
@@ -5163,13 +5210,11 @@ ${segs}
     seq |= fid_nofk(f) << 1;
     u32 rw = fid_resw(f);
     if (rw) {
-      WL_LOAD(a + war - rw, rw)
       WL_ARGS(a, war - rw)
+      WL_FAN_LOAD(a + war - rw, rw, heap_free(e, cls_fit(war + 2), a), f)
     } else {
-      WL_LOAD(a, war)
+      WL_FAN_LOAD(a, war, heap_free(e, cls_fit(war + 2), a), f)
     }
-    heap_free(e, cls_fit(war + 2), a);
-    WL_DYN(f);
   }}
 
   WL_CASE(FID(IO~emit))
@@ -5188,16 +5233,16 @@ ${segs}
     u32 f    = (u32)term_aux(fun);
     u32 war  = fid_arity(f) - 1;
     u64 a    = term_loc(fun);
-    WL_LOAD(a, war)
-    spare_free(e, cls_fit(war), a);
-    WL_LAST(arg)
-    WL_DYN(f);
+    if (!DEVICE && (seq & 2) && !fid_nofk(f) && STK(-1) == FID_EXIT) {
+      seq &= 1;
+    }
+    WL_FAN_APPLY(a, war, arg, spare_free(e, cls_fit(war), a), f)
   }}
 
   WL_CASE(FID_EXIT)
     u32  n = rn;
     Term rv[WL_RESW];
-    WL_SAVE(rv)
+    WL_FAN_SAVE(rv, n)
     WL_OPEN
     if (err_seen(e.mem)) {
       return 0;
@@ -5209,8 +5254,7 @@ ${segs}
     if (DEVICE && wf == FID_EXIT) {
       WL_ARGS(term_loc(cont), idx)
       heap_free(e, cls_fit(STAK_LEN), term_loc(cont));
-      WL_TAKE(rv)
-      WL_RETN(n);
+      WL_FAN_TAKE(rv, n, WL_RETN(n))
     }
     if (cont != TERM_HOLE && fid_resw(wf)) {
       u64 wa = term_loc(cont);
@@ -5219,8 +5263,7 @@ ${segs}
       seq = (seq & 1) | fid_nofk(wf) << 1;
       WL_ARGS(wa, wn - n)
       heap_free(e, cls_fit(wn + 2), wa);
-      WL_TAKE(rv)
-      WL_DYN(wf);
+      WL_FAN_TAKE(rv, n, WL_DYN(wf))
     }
     return task_deliver(e.mem, cont, idx, rv, n);
   }}
