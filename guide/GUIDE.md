@@ -462,13 +462,12 @@ def main() -> IO(Unit):
 
 An `Image` is a quadtree: `Pix{color}` paints a square, and `Qua{tl, tr, bl,
 br}` splits it in four, so a frame is drawn by recursion like everything else,
-in parallel if you want. Events are `Key`, `Mouse`, `Move`, `Look`, `Scroll`
-and `Close`. `Scroll{x, y, dx, dy}` is a wheel or trackpad under the pointer;
-its signed `F32` deltas scroll toward a page's top and left (a notch is 1 on
-X11). For a first-person camera, `Window.grab(window, True{})` hides and holds
-the cursor, and the mouse's motion comes as `Look{dx, dy}` (signed `F32`, in
-`Move`'s units) until `Window.grab(window, False{})` or the window losing focus
-lets it go.
+in parallel if you want. The events are Base's `Event`, each explained in
+`bend2/base.bend`: a pointer (the mouse, a finger or a pen) comes as `Press`,
+`Move`, `Leave` and `Lost`, and a key or button held as the window loses the
+focus comes up. For a first-person camera, `Window.grab(window, True{})`
+hides and holds the cursor, and the mouse's motion comes as `Look{dx, dy}`
+until `Window.grab(window, False{})` or the window losing focus lets it go.
 `App.run` opens a window and calls `view` then `tick` once per frame, until
 `tick` answers `None`. Since the state is affine, `view` must hand it back next
 to the image. Underneath are `Window.open`, `Window.frame` and `Window.close`,
@@ -523,9 +522,9 @@ def main() -> U32:
 
 The alias is local to the importing file, and dots inside a name are just
 characters: `U32.show` needs no module. A module's path is plain names
-(letters, digits, `_` and `-`): `math.bend` is a module, `math.extra.bend` is
-refused. A law left open in one file may be filled in another as
-`def M.name(..)`, so a proof can ship separately from its claim.
+(letters, digits, `_` and `-`, no digit first): `math.bend` is a module,
+`math.extra.bend` is refused. A law left open in one file may be filled in
+another as `def M.name(..)`, so a proof can ship separately from its claim.
 `import 0x<hash>/main.bend as P` imports a package by content hash, fetched
 from the hub and checked against it; `bend main.bend --publish` uploads a file
 with everything it imports and prints that line.
@@ -605,6 +604,7 @@ D<A>  +D<A>  D<&2, A>                    # a datatype; + makes it reusable
 ```python
 # Terms
 42  1.5  3n  'c'  "s"                    # U32, F32, Nat, Char, String
+3n+e                                     # e plus 3, a Nat; no spaces; e runs to the end
 [a, b]  h <> t  (a, b)                   # a list, a cons, a tuple
 K{a, b}  x => e  +x => e                 # a constructor, a lambda
 f(a, b)  f!(a)  t(~g, a)                 # a call, on the GPU, of a template
@@ -645,11 +645,11 @@ whichever chip it lands on.
 A term is one 64-bit word: small values are stored inline, everything else is a
 pointer into a single heap shared by every core and by the GPU. There is no
 garbage collector. Since values are affine, a `match` frees the node it opens
-on the spot, and only `+` values carry a reference count. There is no C stack
-either: each def compiles to a segment of a flat state machine, a call is a
-jump, and a parallel call creates a join task plus one task per call, which the
-scheduler deals across CPU or GPU lanes. `paper/BendRT.pdf` has the design and
-the benchmarks.
+on the spot, but copying any value of a datatype makes all its nodes count their
+fields. There is no C stack either: each def compiles to a segment of a flat
+state machine, a call is a jump, and a parallel call creates a join task plus
+one task per call, which the scheduler deals across CPU or GPU lanes.
+`paper/BendRT.pdf` has the design and the benchmarks.
 
 Bend's theory has one universe and no positivity check: `Type : Type` holds,
 and a datatype may recurse on the left of an arrow. What keeps this consistent

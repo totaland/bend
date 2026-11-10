@@ -9,12 +9,15 @@
 # paused resumes then pauses, fighting pauses then resumes, any other
 # mode stays, shown by rewriting the tests back into the toggled
 # mode. esc_quits is an induction over the events before the Esc; the
-# Key arm is general over the key's quit flag. The sanity laws
-# compute.
+# Key arm is general over the key's quit flag. calm_keeps is an
+# induction over all the events, its Key arm (calm_arm) general over
+# the quit flag too: Spec.Calm is Empty at an Esc or a Close, so an
+# empty match rules them out. The sanity laws compute.
 
 import Base
 import ./bend3d.bend as R
 import ./main.bend as Slash
+import ./SPEC.bend as Spec
 import ./LAWS.bend as Laws
 
 # A pause freezes the world
@@ -44,8 +47,8 @@ def Laws.pause_freezes(n, time, held, hero, boss, flash, cloth, garb, lens, blas
       {==}
     case 1n+k:
       %pause_tick(time, held, hero, boss, flash, cloth, garb, lens, blast)
-        : {Slash.Game.steps(k, _)
-           == Slash.Game{time, held, 0, 4, hero, boss, Slash.Sim.fade(k, Slash.Sim.dec(flash)),
+        : {Spec.steps(k, _)
+           == Slash.Game{time, held, 0, 4, hero, boss, Spec.fade(k, Slash.Sim.dec(flash)),
                 cloth, garb, lens, blast} : Slash.Game}
       Laws.pause_freezes(k, time, held, hero, boss, Slash.Sim.dec(flash), cloth, garb, lens, blast)
 
@@ -103,20 +106,74 @@ def Laws.esc_quits(pre, post, g):
       {==}
     case Key{+code, +down} <> rest:
       esc_arm(U32.is_eq(code, 27), Slash.Game.key(g, code, down),
-        Slash.Game.cat(rest, Key{27, True{}} <> post),
+        Spec.cat(rest, Key{27, True{}} <> post),
         s => Laws.esc_quits(rest, post, s))
     case Text{text} <> rest:
       Laws.esc_quits(rest, post, g)
-    case Mouse{x, y, button, down} <> rest:
+    case Press{id, tool, x, y, time, button, down} <> rest:
       Laws.esc_quits(rest, post, g)
-    case Move{x, y} <> rest:
+    case Move{id, tool, x, y, time} <> rest:
+      Laws.esc_quits(rest, post, g)
+    case Leave{id} <> rest:
+      Laws.esc_quits(rest, post, g)
+    case Lost{id} <> rest:
       Laws.esc_quits(rest, post, g)
     case Look{dx, dy} <> rest:
       Laws.esc_quits(rest, post, g)
     case Scroll{x, y, dx, dy} <> rest:
       Laws.esc_quits(rest, post, g)
+    case Focus{on} <> rest:
+      Laws.esc_quits(rest, post, g)
     case Close{} <> rest:
       {==}
+
+# A calm frame goes on
+# ---------------------
+
+# one key of a calm frame: an Esc is ruled out by the calm, any other
+# key keeps the game and the rest of the frame goes on
+law calm_arm:
+  for b: Bool
+  for g: Slash.Game
+  for -rest: List<Event>
+  for e: Spec.Calm.key(b, Spec.Calm(rest))
+  for ih: @s: Slash.Game -> Spec.Calm(rest) -> &g2: Slash.Game -> {Slash.Game.events(rest, s) == Some{g2} : Maybe<Slash.Game>}
+  exs g2: Slash.Game
+  {Maybe.bind(&1, Slash.Game, Slash.Game, Slash.Game.quit(b, g),
+      s => Slash.Game.events(rest, s)) == Some{g2} : Maybe<Slash.Game>}
+
+def calm_arm(b, g, rest, e, ih):
+  match b:
+    case True{}:
+      match e:
+    case False{}:
+      ih(g, e)
+
+def Laws.calm_keeps(es, g, e):
+  match es:
+    case Nil{}:
+      (g, {==})
+    case Key{+code, +down} <> rest:
+      calm_arm(U32.is_eq(code, 27), Slash.Game.key(g, code, down), rest, e,
+        s => c => Laws.calm_keeps(rest, s, c))
+    case Text{text} <> rest:
+      Laws.calm_keeps(rest, g, e)
+    case Press{id, tool, x, y, time, button, down} <> rest:
+      Laws.calm_keeps(rest, g, e)
+    case Move{id, tool, x, y, time} <> rest:
+      Laws.calm_keeps(rest, g, e)
+    case Leave{id} <> rest:
+      Laws.calm_keeps(rest, g, e)
+    case Lost{id} <> rest:
+      Laws.calm_keeps(rest, g, e)
+    case Look{dx, dy} <> rest:
+      Laws.calm_keeps(rest, g, e)
+    case Scroll{x, y, dx, dy} <> rest:
+      Laws.calm_keeps(rest, g, e)
+    case Focus{on} <> rest:
+      Laws.calm_keeps(rest, g, e)
+    case Close{} <> rest:
+      match e:
 
 # Sanity
 # ------
@@ -128,6 +185,9 @@ def Laws.pause_toggles():
   {==}
 
 def Laws.dec_floor():
+  {==}
+
+def Laws.dec_is_spec(x):
   {==}
 
 def Laws.arrows_are_wasd():

@@ -19,11 +19,12 @@ def f(x):
 #|- expected : x^0
 #|- observed : NS{x^0}
 #|Context:
-#|- x : N
+#|- x : N (shadowed)
 #|- x : U32
 #|Location: f
 #|14 | def f(x):
 #|15>|   x => {==}
 #|   |        ^^^^
 #|16 |
+#|Note: the left side of the equality is the expected, the right side is the observed.
 #|exit 1

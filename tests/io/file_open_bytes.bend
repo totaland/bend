@@ -1,0 +1,71 @@
+# io (io_file_open_bytes): File.open_bytes opens a path given as bytes,
+# with no UTF-8 encoding (#1798). UTF-8 bytes name the file File.open's
+# String names; a value past 255 fails with EINVAL and a 0 with EILSEQ.
+import Base
+
+def tmp(salt: U32) -> String:
+  "/tmp/bend_t_io_open_bytes_" ++ U32.show(salt) ++ "_"
+
+def ascii(s: String, tail: List<&2, U32>) -> List<&2, U32>:
+  match s:
+    case SNil{}:
+      tail
+    case SCon{c, t}:
+      Char.to_u32(c) <> ascii(t, tail)
+
+def pick(ok: Bool, yes: String, no: String) -> String:
+  match ok:
+    case True{}:
+      yes
+    case False{}:
+      no
+
+# EILSEQ is 92 on macOS and 84 on Linux.
+def code(+c: U32) -> String:
+  pick(U32.is_eq(c, 92) || U32.is_eq(c, 84), "EILSEQ", U32.show(c))
+
+def shown(r: Result<&1, &1, U32 & String, File>) -> IO(String):
+  match r:
+    case Done{file}:
+      do IO<String>:
+        File.close(file)
+        return "opened"
+    case Fail{(c, message)}:
+      IO.pure(String, code(c))
+
+def written(pair: File & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
+  (file, result) = pair
+  do IO<Unit>:
+    IO.pass(Unit, result)
+    File.close(file)
+
+def read(pair: File & Result<&1, &1, U32 & String, String>) -> IO(String):
+  (file, result) = pair
+  do IO<String>:
+    text : String <- IO.pass(String, result)
+    File.close(file)
+    return text
+
+def main() -> IO(Unit):
+  do IO<Unit>:
+    +salt : U32 <- IO.try(U32, IO.random_u32())
+    f : File <- IO.try(File, File.open_bytes(ascii(tmp(salt), [195, 169]), "w"))
+    p : File & Result<&1, &1, U32 & String, Unit> <- File.write(f, "hi")
+    written(p)
+    f : File <- IO.try(File, File.open(tmp(salt) ++ "é", "r"))
+    p : File & Result<&1, &1, U32 & String, String> <- File.read(f, 16)
+    t : String <- read(p)
+    IO.print("utf-8 bytes: " ++ t)
+    r : Result<&1, &1, U32 & String, File> <- File.open_bytes(ascii(tmp(salt), [256]), "r")
+    t : String <- shown(r)
+    IO.print("past 255: " ++ t)
+    r : Result<&1, &1, U32 & String, File> <- File.open_bytes(ascii(tmp(salt), [0, 120]), "w")
+    t : String <- shown(r)
+    done : Unit <- IO.print("nul: " ++ t)
+    gone : Result<&1, &1, U32 & String, U32 & (String & String)> <-
+      Process.run("rm", ["-f", tmp(salt) ++ "é"], "", 128, 1000)
+    return done
+
+#|utf-8 bytes: hi
+#|past 255: 22
+#|nul: EILSEQ
