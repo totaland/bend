@@ -3559,7 +3559,9 @@ static bool corpus_grow(u64* H, u64 need);
 // Tables
 // ======
 
-typedef struct { u8 ar, resw, bangs, nofk, hnfk; } Fid;
+// Padded to 8 bytes: Metal misreads a constant array of 5-byte structs, and
+// a bang then never delivers ("frontier drained without a result").
+typedef struct { u8 ar, resw, bangs, nofk, hnfk, pad[3]; } Fid;
 typedef struct { u8 ar, hot; u16 spine; } Cid;
 
 ${tabs}
